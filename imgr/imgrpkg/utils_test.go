@@ -21,10 +21,10 @@ import (
 )
 
 const (
-	testIPAddr             = "127.0.0.1"
-	testRetryRPCPort       = 32357
-	testHTTPServerPort     = 15347
-	testSwiftProxyTCPPort  = 24367
+	testIPAddr             = "127.0.0.1" // Don't use IPv6... the code doesn't properly "join" this with :port #s
+	testRetryRPCPort       = 32356
+	testHTTPServerPort     = 15346
+	testSwiftProxyTCPPort  = 8080
 	testSwiftAuthUser      = "test"
 	testSwiftAuthKey       = "test"
 	testContainer          = "testContainer"
@@ -56,8 +56,6 @@ var testGlobals *testGlobalsStruct
 
 func testSetup(t *testing.T, retryrpcCallbacks interface{}) {
 	var (
-		authRequestHeaders         http.Header
-		authResponseHeaders        http.Header
 		confStrings                []string
 		err                        error
 		putAccountRequestHeaders   http.Header
@@ -136,11 +134,15 @@ func testSetup(t *testing.T, retryrpcCallbacks interface{}) {
 
 		"IMGR.CheckPointInterval=10s",
 
+		"IMGR.AuthTokenCheckInterval=1m",
+
 		"IMGR.FetchNonceRangeToReturn=100",
 
 		"IMGR.MinLeaseDuration=250ms",
 		"IMGR.LeaseInterruptInterval=250ms",
-		"IMGR.LeaseInterruptLimit=20",
+		"IMGR.LeaseInterruptLimit=5",
+		"IMGR.LeaseEvictLowLimit=100000",
+		"IMGR.LeaseEvictHighLimit=100010",
 
 		"IMGR.SwiftRetryDelay=100ms",
 		"IMGR.SwiftRetryExpBackoff=2",
@@ -148,6 +150,8 @@ func testSetup(t *testing.T, retryrpcCallbacks interface{}) {
 
 		"IMGR.SwiftTimeout=10m",
 		"IMGR.SwiftConnectionPoolSize=128",
+
+		"IMGR.ParallelObjectDeletePerVolumeLimit=100",
 
 		"IMGR.InodeTableCacheEvictLowLimit=10000",
 		"IMGR.InodeTableCacheEvictHighLimit=10010",
@@ -176,21 +180,13 @@ func testSetup(t *testing.T, retryrpcCallbacks interface{}) {
 
 	err = iswiftpkg.Start(testGlobals.confMap)
 	if nil != err {
-		t.Fatalf("iswifpkg.Start(testGlobals.confMap) failed: %v", err)
+		t.Fatalf("iswiftpkg.Start(testGlobals.confMap) failed: %v", err)
 	}
 
-	authRequestHeaders = make(http.Header)
-
-	authRequestHeaders["X-Auth-User"] = []string{testSwiftAuthUser}
-	authRequestHeaders["X-Auth-Key"] = []string{testSwiftAuthKey}
-
-	authResponseHeaders, _, err = testDoHTTPRequest("GET", testGlobals.authURL, authRequestHeaders, nil)
+	err = testDoAuth()
 	if nil != err {
-		t.Fatalf("testDoHTTPRequest(\"GET\", testGlobals.authURL, authRequestHeaders) failed: %v", err)
+		t.Fatalf("testDoAuth() failed: %v", err)
 	}
-
-	testGlobals.authToken = authResponseHeaders.Get("X-Auth-Token")
-	testGlobals.accountURL = authResponseHeaders.Get("X-Storage-Url")
 
 	testGlobals.containerURL = testGlobals.accountURL + "/" + testContainer
 
@@ -227,7 +223,7 @@ func testSetup(t *testing.T, retryrpcCallbacks interface{}) {
 	}
 
 	testGlobals.retryrpcClientConfig = &retryrpc.ClientConfig{
-		IPAddr:                   testIPAddr,
+		DNSOrIPAddr:              testIPAddr,
 		Port:                     testRetryRPCPort,
 		RootCAx509CertificatePEM: testGlobals.caCertPEMBlock,
 		Callbacks:                retryrpcCallbacks,
@@ -304,5 +300,25 @@ func testDoHTTPRequest(method string, url string, requestHeaders http.Header, re
 	responseHeaders = httpResponse.Header
 
 	err = nil
+	return
+}
+
+func testDoAuth() (err error) {
+	var (
+		authRequestHeaders  http.Header
+		authResponseHeaders http.Header
+	)
+
+	authRequestHeaders = make(http.Header)
+
+	authRequestHeaders["X-Auth-User"] = []string{testSwiftAuthUser}
+	authRequestHeaders["X-Auth-Key"] = []string{testSwiftAuthKey}
+
+	authResponseHeaders, _, err = testDoHTTPRequest("GET", testGlobals.authURL, authRequestHeaders, nil)
+	if nil == err {
+		testGlobals.authToken = authResponseHeaders.Get("X-Auth-Token")
+		testGlobals.accountURL = authResponseHeaders.Get("X-Storage-Url")
+	}
+
 	return
 }

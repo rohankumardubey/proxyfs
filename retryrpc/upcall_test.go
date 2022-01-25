@@ -70,21 +70,23 @@ func testUpCall(t *testing.T, useTLS bool) {
 
 	if useTLS {
 		clientConfig = &ClientConfig{
-			IPAddr:                   testIPAddr,
+			DNSOrIPAddr:              testIPAddr,
 			Port:                     testPort,
 			RootCAx509CertificatePEM: testTLSCerts.caCertPEMBlock,
 			Callbacks:                cb,
 			DeadlineIO:               60 * time.Second,
 			KeepAlivePeriod:          60 * time.Second,
+			Logger:                   newLogger(),
 		}
 	} else {
 		clientConfig = &ClientConfig{
-			IPAddr:                   testIPAddr,
+			DNSOrIPAddr:              testIPAddr,
 			Port:                     testPort,
 			RootCAx509CertificatePEM: nil,
 			Callbacks:                cb,
 			DeadlineIO:               60 * time.Second,
 			KeepAlivePeriod:          60 * time.Second,
+			Logger:                   newLogger(),
 		}
 	}
 	rrClnt, newErr := NewClient(clientConfig)

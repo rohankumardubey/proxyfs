@@ -1,5 +1,68 @@
 # ProxyFS Release Notes
 
+## 2.00.0 (January 25, 2022)
+
+### Notes:
+
+This release marks the transition to the re-implementation of ProxyFS. The primary goal
+of the new release was to better support distributed FUSE clients of a ProxyFS file system.
+Initially, ProxyFS ran on one of an OpenStack Swift's Proxy nodes and was tighly integrated
+with the Proxy "ring" such that Object API access to a ProxyFS-managed portion of the namespace
+would map to a single ProxyFS service supporting that file system. For network file access, both
+NFS (via nfsd) and SMB (via Samba) were integrated. This approach had a number of drawbacks not
+the least of which was file system access data paths all traversed a single ProxyFS instance.
+Notably, Object API access only routed control path through the ProxyFS instance. Data transfers
+via the Object API to ProxyFS file systems still benefitted from the scale-out nature of OpenStack
+Swift.
+
+To better address the scale-out need of the file system data path when accessed via POSIX, a
+FUSE client called PFSAgent was constructed as well. This approach nicely moved the POSIX file
+system access off of a Swift Proxy node. Alas, PFSAgent still imposed a single data path limitation
+for POSIX file system access to a ProxyFS file system.
+
+In designing the changes required to PFSAgent to support a truly distributed data path, the
+complexities of integrating with the existing ProxyFS architecture proved overwhelming. Indeed,
+much of the complexity derived from the continued access to the file system provided directly
+by the central ProxyFS service that had become redundant. In addition, supporting Object API
+access as well presented even more challenge. Finally, even the tighly coupled integration of
+ProxyFS with the Proxy "ring" of Swift was less than ideal.
+
+So a new approach was taken. This presented an opportunity to significantly clean up the "on-disk"
+layout of the file system. In addition, improvements to OpenStack Swift to support very large
+Containers obsoleted the previous requirement to map a ProxyFS file system on top of an entire
+Swift Account. Along the way, a couple of key ProxyFS features were deprecated:
+
+* Object API Access - what was often termed "Bi-Modal", the ability to read and write to file system
+elements depended upon the otherwise undesireable tight integration with each Swift Proxy... so was, for the time being, thought to be expendable
+
+* SnapShots - similarly, the ability to access a read-only view of the file system at some
+scheduled point in the past was a rarely cited feature that, for now, is not supported anymore
+
+This is a big change to consume all at once. To aid in this, there are a couple of ways to start
+looking at the codebase:
+
+* The leading `i` convention - a quick perusal of the ProxyFS repo will reveal that a large body of code has been removed. Meanwhile, a new set of directories have arrived - each starting with the letter `i`. Also, many subdirectories follow a convention of containing a command line program in the parent directory `iXXX/` with a package implementation subdirectory with the `pkg` suffix (i.e. `iXXX/iXXXpkg/`). These are:
+  * `iauth` - a simplified "AUTH" plug-in framework for which a Swift Auth-compliant example is provided (in `iauth/iauth-swift/`)
+  * `icert` - a command-line tool to generate RootCA and signed certificates
+  * `ickpt` - an optional service to provide a highly available, strictly consistent solution for the CheckPoint record of each file system that is the only Swift entity subject to Eventual Consistency imprecision
+  * `iclient` - a FUSE client for a ProxyFS file system of which there can be many
+  * `idestroy` - a simple tool to clean out an OpenStack Swift Container
+  * `ihtml` - support files for embedded HTTP servers in `iclient` and `imgr`
+  * `ilayout` - a complete specification of the "on-disk" layout of a ProxyFS file system
+  * `imgr` - a centralized service that provides a CheckPoint'd management of a ProxyFS file system's Inode Table as well as a Lease Manager enabling the scale-out of `iclient` instances presenting a ProxyFS file system
+  * `iswift` - a minimal RAM emulation of OpenStack Swift API
+
+* A move to GoDoc (away from readme's and other forms of often out-of-date documentation) has been provided:
+  * To launch the GoDoc server: `godoc -goroot <path to your ProxyFS repo>`
+  * Browse to: http://localhost:6060/pkg/ for things like
+    * `github.com/NVIDIA/proxyfs/ilayout` - the entire "on-disk" file system layout description
+    * `github.com/NVIDIA/proxyfs/imgr/imgrpkg` - config and API info for `imgr`
+    * `github.com/NVIDIA/proxyfs/iclient/iclientpkg` - config and API info for `iclient`
+
+With such a dramatic departure from the 1.XX line, it should be expected that the current ProxyFS code base is in flux as problems are identified and addressed. In addition, a large body of performance tuning remains outstanding.
+
+Welcome to 2.XX !!!
+
 ## 1.19.1 (May 13, 2021)
 
 ### Bug Fixes:

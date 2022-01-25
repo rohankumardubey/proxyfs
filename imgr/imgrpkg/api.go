@@ -1,36 +1,53 @@
-// Copyright (c) 2015-2021, NVIDIA CORPORATION.
+// Copyright (c) 2015-2022, NVIDIA CORPORATION.
 // SPDX-License-Identifier: Apache-2.0
 
 // Package imgrpkg implements the server side Inode Management for ProxyFS volumes.
-// The package supports to communications protocols. The balance of the package
-// documentation will describe the Go-callable API. Note that func's listed under
-// type RetryRPCServerStruct are the RPCs issued by the client side via package
-// retryrpc connections (and, thus, not intended to be called directly).
+// While the package provides a small set of Go-callable APIs, the bulk of its
+// functionality is accessed via package retryrpc-exposed RPCs. While these RPCs
+// reference active volumes known to an imgrpkg instance, a RESTful API is provided
+// to specify those active volumes.
+//
+// Note that func's listed under type RetryRPCServerStruct are the RPCs issued by
+// the client side via package retryrpc connections (and, thus, not intended to be
+// called directly).
 //
 // To configure an imgrpkg instance, Start() is called passing, as the sole
 // argument, a package conf ConfMap. Here is a sample .conf file:
 //
 //  [IMGR]
-//  PublicIPAddr:                         172.28.128.2
-//  PrivateIPAddr:                        172.28.128.2
+//  PublicIPAddr:                         imgr
+//  PrivateIPAddr:                        imgr
 //  RetryRPCPort:                         32356
 //  HTTPServerPort:                       15346
+//
+//  CheckPointIPAddrs:                           # List of ickpt cluster instance IPAddr's
+//  CheckPointPort:                       33123  # Only required if CheckPointIPAddrs is non-empty
+//  CheckPointCACertFilePath:                    # Defaults to /dev/null disabling TLS
+//  CheckPointRetryDelay:                 100ms  # Only required if CheckPointIPAddrs is non-empty
+//  CheckPointRetryExpBackoff:            2      # Only required if CheckPointIPAddrs is non-empty
+//  CheckPointRetryLimit:                 4      # Only required if CheckPointIPAddrs is non-empty
+//  CheckPointTimeout:                    10m    # Only required if CheckPointIPAddrs is non-empty
+//  CheckPointConnectionPoolSize:         10     # Only required if CheckPointIPAddrs is non-empty
 //
 //  RetryRPCTTLCompleted:                 10m
 //  RetryRPCAckTrim:                      100ms
 //  RetryRPCDeadlineIO:                   60s
 //  RetryRPCKeepAlivePeriod:              60s
 //
-//  RetryRPCCertFilePath:                              # If both RetryRPC{Cert|Key}FilePath are missing or empty,
-//  RetryRPCKeyFilePath:                               #   non-TLS RetryRPC will be selected; otherwise TLS will be used
+//  RetryRPCCertFilePath:                        # If both RetryRPC{Cert|Key}FilePath are missing or empty,
+//  RetryRPCKeyFilePath:                         #   non-TLS RetryRPC will be selected; otherwise TLS will be used
 //
 //  CheckPointInterval:                   10s
+//
+//  AuthTokenCheckInterval:               1m
 //
 //  FetchNonceRangeToReturn:              100
 //
 //  MinLeaseDuration:                     250ms
 //  LeaseInterruptInterval:               250ms
 //  LeaseInterruptLimit:                  20
+//  LeaseEvictLowLimit:                   100000
+//  LeaseEvictHighLimit:                  100010
 //
 //  SwiftRetryDelay:                      100ms
 //  SwiftRetryExpBackoff:                 2
@@ -39,14 +56,16 @@
 //  SwiftTimeout:                         10m
 //  SwiftConnectionPoolSize:              128
 //
+//  ParallelObjectDeletePerVolumeLimit:   100
+//
 //  InodeTableCacheEvictLowLimit:         10000
 //  InodeTableCacheEvictHighLimit:        10010
 //
 //  InodeTableMaxInodesPerBPlusTreePage:  2048
 //  RootDirMaxDirEntriesPerBPlusTreePage: 1024
 //
-//  LogFilePath:                                       # imgr.log
-//  LogToConsole:                         true         # false
+//  LogFilePath:                                 # imgr.log
+//  LogToConsole:                         true   # false
 //  TraceEnabled:                         false
 //
 // Most of the config keys are required and must have values. One exception
@@ -59,9 +78,8 @@
 // files, the retryrpc package will be configured to use TLS. In any event,
 // the RPCs will be available via <PublicIPAddr>:<RetryRPCPort>.
 //
-// In addition to the package retryrpc-exposed RPCs, the package also includes
-// an embedded HTTP Server (at URL http://<PrivateIPAddr>:<HTTPServerPort>)
-// responses to the following:
+// The RESTful API is provided by an embedded HTTP Server
+// (at URL http://<PrivateIPAddr>:<HTTPServerPort>) responds to the following:
 //
 //  DELETE /volume/<volumeName>
 //
@@ -76,6 +94,10 @@
 //  GET /stats
 //
 // This will return a raw bucketstats dump.
+//
+//  GET /version
+//
+// This will return the imgr version.
 //
 //  GET /volume
 //
@@ -95,7 +117,10 @@
 //     "AuthToken" : "AUTH_tk0123456789abcde0123456789abcdef0"
 //  }
 //
-// This will cause the specified StorageURL to be formatted.
+// This will cause the specified StorageURL to be formatted. The StorageURL
+// specified in the JSON document content identifies the Container for format.
+// The AuthToken in the JSON document content provides the authentication to
+// use during the formatting process.
 //
 //  PUT /volume/<volumeName>
 //  Content-Type: application/json
@@ -106,6 +131,23 @@
 //
 // This will cause the specified <volumeName> to be served. The StorageURL
 // specified in the JSON document content identifies the Container to serve.
+// Clients will each supply an AuthToken in their Mount/RenewMount requests
+// that will be used to access the Container.
+//
+//  PUT /volume/<volumeName>
+//  Content-Type: application/json
+//
+//  {
+//     "StorageURL": "http://172.28.128.2:8080/v1/AUTH_test/con",
+//     "AuthToken" : "AUTH_tk0123456789abcde0123456789abcdef0"
+//  }
+//
+// This will cause the specified <volumeName> to be served. The StorageURL
+// specified in the JSON document content identifies the Container to serve.
+// Clients will each supply an AuthToken in their Mount/RenewMount requests
+// that will be used to access the Container. As a debugging aid, and in the
+// case where no Clients have <volumeName> mounted, the AuthToken in the JSON
+// document content will be used to access the Container.
 //
 package imgrpkg
 
@@ -149,10 +191,14 @@ func LogInfof(format string, args ...interface{}) {
 // E* specifies the prefix of an error string returned by any RetryRPC API
 //
 const (
-	EAuthTokenRejected  = "EAuthTokenRejected:"
-	EVolumeBeingDeleted = "EVolumeBeingDeleted:"
-	EUnknownMountID     = "EUnknownMountID:"
-	EUnknownVolumeName  = "EUnknownVolumeName:"
+	EAuthTokenRejected      = "EAuthTokenRejected:"
+	EBadOpenCountAdjustment = "EBadOpenCountAdjustment:"
+	ELeaseRequestDenied     = "ELeaseRequestDenied:"
+	EMissingLease           = "EMissingLease:"
+	EVolumeBeingDeleted     = "EVolumeBeingDeleted:"
+	EUnknownInodeNumber     = "EUnknownInodeNumber:"
+	EUnknownMountID         = "EUnknownMountID:"
+	EUnknownVolumeName      = "EUnknownVolumeName:"
 
 	ETODO = "ETODO:"
 )
@@ -196,6 +242,8 @@ type RenewMountResponseStruct struct{}
 
 // RenewMount updates the AuthToken for the specified MountID.
 //
+// Possible errors: EAuthTokenRejected EUnknownMountID
+//
 func (dummy *RetryRPCServerStruct) RenewMount(renewMountRequest *RenewMountRequestStruct, renewMountResponse *RenewMountResponseStruct) (err error) {
 	return renewMount(renewMountRequest, renewMountResponse)
 }
@@ -213,11 +261,38 @@ type UnmountResponseStruct struct{}
 // Unmount requests that the given MountID be released (and implicitly releases
 // any Leases held by the MountID).
 //
+// Possible errors: EAuthTokenRejected EUnknownMountID
+//
 func (dummy *RetryRPCServerStruct) Unmount(unmountRequest *UnmountRequestStruct, unmountResponse *UnmountResponseStruct) (err error) {
 	return unmount(unmountRequest, unmountResponse)
 }
 
+// VolumeStatusRequestStruct is the request object for VolumeStatus.
+//
+type VolumeStatusRequestStruct struct {
+	MountID string
+}
+
+// VolumeStatusResponseStruct is the response object for VolumeStatus.
+//
+type VolumeStatusResponseStruct struct {
+	NumInodes       uint64
+	ObjectCount     uint64
+	ObjectSize      uint64
+	BytesReferenced uint64
+}
+
+// VolumeStatus requests the current status of the mounted volume.
+//
+// Possible errors: EAuthTokenRejected EUnknownMountID
+//
+func (dummy *RetryRPCServerStruct) VolumeStatus(volumeStatusRequest *VolumeStatusRequestStruct, volumeStatusResponse *VolumeStatusResponseStruct) (err error) {
+	return volumeStatus(volumeStatusRequest, volumeStatusResponse)
+}
+
 // FetchNonceRangeRequestStruct is the request object for FetchNonceRange.
+//
+// Possible errors: EAuthTokenRejected EUnknownMountID
 //
 type FetchNonceRangeRequestStruct struct {
 	MountID string
@@ -233,6 +308,8 @@ type FetchNonceRangeResponseStruct struct {
 // FetchNonceRange requests a range of uint64 nonce values (i.e. values that will
 // never be reused).
 //
+// Possible errors: EAuthTokenRejected EUnknownMountID
+//
 func (dummy *RetryRPCServerStruct) FetchNonceRange(fetchNonceRangeRequest *FetchNonceRangeRequestStruct, fetchNonceRangeResponse *FetchNonceRangeResponseStruct) (err error) {
 	return fetchNonceRange(fetchNonceRangeRequest, fetchNonceRangeResponse)
 }
@@ -247,21 +324,46 @@ type GetInodeTableEntryRequestStruct struct {
 // GetInodeTableEntryResponseStruct is the response object for GetInodeTableEntry.
 //
 type GetInodeTableEntryResponseStruct struct {
-	// TODO
+	InodeHeadObjectNumber uint64
+	InodeHeadLength       uint64
 }
 
 // GetInodeTableEntry requests the Inode information for the specified Inode
 // (which must have an active Shared or Exclusive Lease granted to the MountID).
 //
+// Possible errors: EAuthTokenRejected EMissingLease EUnknownInodeNumber EUnknownMountID
+//
 func (dummy *RetryRPCServerStruct) GetInodeTableEntry(getInodeTableEntryRequest *GetInodeTableEntryRequestStruct, getInodeTableEntryResponse *GetInodeTableEntryResponseStruct) (err error) {
 	return getInodeTableEntry(getInodeTableEntryRequest, getInodeTableEntryResponse)
 }
 
-// PutInodeTableEntriesRequestStruct is the request object for PutInodeTableEntries.
+// PutInodeTableEntryStruct is used to indicate the change to an individual
+// InodeTableEntry as part of the collection of changes in a PutInodeTablesEntries
+// request (which must have an active Exclusive Lease granted to the MountID).
+//
+type PutInodeTableEntryStruct struct {
+	InodeNumber           uint64
+	InodeHeadObjectNumber uint64
+	InodeHeadLength       uint64
+}
+
+// PutInodeTableEntriesRequestStruct is the request object for PutInodeTableEntries
+// (which must have an active Exclusive Lease for every PutInodeTableEntryStruct.InodeNumber
+// granted to the MountID).
+//
+// The SuperBlockInode{ObjectCount|ObjectSize|BytesReferenced}Adjustment fields
+// are used to update the corresponding fields in the volume's SuperBlock.
+//
+// Note that dereferenced objects listed in the DereferencedObjectNumberArray will
+// not be deleted until the next CheckPoint is performed.
 //
 type PutInodeTableEntriesRequestStruct struct {
-	MountID string
-	// TODO
+	MountID                                  string
+	UpdatedInodeTableEntryArray              []PutInodeTableEntryStruct
+	SuperBlockInodeObjectCountAdjustment     int64
+	SuperBlockInodeObjectSizeAdjustment      int64
+	SuperBlockInodeBytesReferencedAdjustment int64
+	DereferencedObjectNumberArray            []uint64
 }
 
 // PutInodeTableEntriesResponseStruct is the response object for PutInodeTableEntries.
@@ -270,6 +372,8 @@ type PutInodeTableEntriesResponseStruct struct{}
 
 // PutInodeTableEntries requests an atomic update of the listed Inodes (which must
 // each have an active Exclusive Lease granted to the MountID).
+//
+// Possible errors: EAuthTokenRejected EMissingLease EUnknownMountID
 //
 func (dummy *RetryRPCServerStruct) PutInodeTableEntries(putInodeTableEntriesRequest *PutInodeTableEntriesRequestStruct, putInodeTableEntriesResponse *PutInodeTableEntriesResponseStruct) (err error) {
 	return putInodeTableEntries(putInodeTableEntriesRequest, putInodeTableEntriesResponse)
@@ -284,14 +388,14 @@ type DeleteInodeTableEntryRequestStruct struct {
 
 // DeleteInodeTableEntryResponseStruct is the response object for DeleteInodeTableEntry.
 //
-type DeleteInodeTableEntryResponseStruct struct {
-	// TODO
-}
+type DeleteInodeTableEntryResponseStruct struct{}
 
 // DeleteInodeTableEntry requests the specified Inode information be deleted.
 // An active Exclusive Lease must be granted to the MountID. Note that
 // unless/until the OpenCount for the Inode drops to zero, the Inode will
 // still exist.
+//
+// Possible errors: ETODO
 //
 func (dummy *RetryRPCServerStruct) DeleteInodeTableEntry(deleteInodeTableEntryRequest *DeleteInodeTableEntryRequestStruct, deleteInodeTableEntryResponse *DeleteInodeTableEntryResponseStruct) (err error) {
 	return deleteInodeTableEntry(deleteInodeTableEntryRequest, deleteInodeTableEntryResponse)
@@ -307,16 +411,15 @@ type AdjustInodeTableEntryOpenCountRequestStruct struct {
 
 // AdjustInodeTableEntryOpenCountResponseStruct is the response object for AdjustInodeTableEntryOpenCount.
 //
-type AdjustInodeTableEntryOpenCountResponseStruct struct {
-	CurrentOpenCountThisMount uint64
-	CurrentOpenCountAllMounts uint64
-}
+type AdjustInodeTableEntryOpenCountResponseStruct struct{}
 
 // AdjustInodeTableEntryOpenCount requests the specified Inode's OpenCount be
-// adjusted. A (Shared or Exclusive) Lease must be granted to the MountID. If
-// the adjustment results in an OpenCount of zero and the Inode has been marked
-// for deletion by a prior call to DeleteInodeTableEntry, the Inode will be
-// deleted.
+// adjusted. If the referenced InodeNumber is non-zero, a (Shared or Exclusive)
+// Lease must be granted to the MountID. If the adjustment results in an OpenCount
+// of zero and the Inode has been marked for deletion by a prior call to
+// DeleteInodeTableEntry, the Inode will be deleted.
+//
+// Possible errors: EAuthTokenRejected EBadOpenCountAdjustment EMissingLease EUnknownMountID
 //
 func (dummy *RetryRPCServerStruct) AdjustInodeTableEntryOpenCount(adjustInodeTableEntryOpenCountRequest *AdjustInodeTableEntryOpenCountRequestStruct, adjustInodeTableEntryOpenCountResponse *AdjustInodeTableEntryOpenCountResponseStruct) (err error) {
 	return adjustInodeTableEntryOpenCount(adjustInodeTableEntryOpenCountRequest, adjustInodeTableEntryOpenCountResponse)
@@ -334,7 +437,7 @@ type FlushResponseStruct struct{}
 
 // Flush that the results of prior PutInodeTableEntries requests be persisted.
 //
-// Possible errors: EUnknownMountID
+// Possible errors: EAuthTokenRejected EUnknownMountID
 //
 func (dummy *RetryRPCServerStruct) Flush(flushRequest *FlushRequestStruct, flushResponse *FlushResponseStruct) (err error) {
 	return flush(flushRequest, flushResponse)
@@ -382,6 +485,8 @@ type LeaseResponseStruct struct {
 }
 
 // Lease is a blocking Lease Request.
+//
+// Possible errors: EAuthTokenRejected EUnknownMountID
 //
 func (dummy *RetryRPCServerStruct) Lease(leaseRequest *LeaseRequestStruct, leaseResponse *LeaseResponseStruct) (err error) {
 	return lease(leaseRequest, leaseResponse)

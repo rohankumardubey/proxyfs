@@ -13,6 +13,26 @@
 // in the file system) is ever written twice except for the CheckPoint described
 // below.
 //
+// To achieve uniqueness of entities like Object Names, it is expected there is
+// an isomorhic mapping from Object Numbers to/from Object Names. Uniqueness is
+// achieved by utilizing a nonce sequence of 64-bit numbers, starting at zero
+// and incrementing by one. The rate of creation of nonce-identified entities
+// (like Objects) is certainly slow enough such that just remembering the highest
+// nonce utilized is sufficient to ensure no nonce value is ever reused.
+//
+// Converting a nonce-assigned Object Number to/from an Object Name could be
+// accomplished by simply converting between the 64-bit binary value and the
+// corresponding 16 Hex Digit string. Unfortunately, some solutions (e.g.
+// OpenStack Swift) address the challenge of very large Buckets/Containers via
+// a prefix-based sharding operation. In essence, some string prefix of all
+// Object Names in a particular shard will be common and no Objects Names with
+// that same prefix will be in any other shard. Ideally, once a Bucket/Container
+// has been sharded, new Objects placed in the shards will be evenly distributed
+// (so as to keep each shard roughly the same size baring unbalanced deletions).
+// Hence, the conversion of a slowly monitonically increasing sequence of
+// Object Numbers is best served by reversing the digits in the corresponding
+// Object Names.
+//
 // At the top level, the file system periodically checkpoints. This enables the
 // file system to be complemented by the extreme scale of such Object Store
 // systems despite such often suffering long latencies and coarse granularity
@@ -183,18 +203,22 @@ type InodeTableLayoutEntryV1Struct struct {
 // count of the number of InodeTableLayoutEntryV1Struct's followed by the
 // serialization of each one.
 //
+// The PendingDeleteObjectNumberArray is serialized as a preceeding LittleEndian
+// count of the number of ObjectNumbers followed by each LittleEndian ObjectNumber.
+//
 // Note that the CheckPointV1Struct.SuperBlockLength also includes the bytes for holding
 // the ObjectTrailerStruct{ObjType: SuperBlockType, Version: SuperBlockVersionV1} that is
 // appended.
 //
 type SuperBlockV1Struct struct {
-	InodeTableRootObjectNumber uint64                          // Identifies the Object containing the root of the InodeTable
-	InodeTableRootObjectOffset uint64                          // Starting offset in the Object of the root of the InodeTable
-	InodeTableRootObjectLength uint64                          // Number of bytes in the Object of the root of the InodeTable
-	InodeTableLayout           []InodeTableLayoutEntryV1Struct // Describes the data and space occupied by the the InodeTable
-	InodeObjectCount           uint64                          // Number of Objects holding Inodes
-	InodeObjectSize            uint64                          // Sum of sizes of all Objects holding Inodes
-	InodeBytesReferenced       uint64                          // Sum of bytes referenced in all Objects holding Inodes
+	InodeTableRootObjectNumber     uint64                          // Identifies the Object containing the root of the InodeTable
+	InodeTableRootObjectOffset     uint64                          // Starting offset in the Object of the root of the InodeTable
+	InodeTableRootObjectLength     uint64                          // Number of bytes in the Object of the root of the InodeTable
+	InodeTableLayout               []InodeTableLayoutEntryV1Struct // Describes the data and space occupied by the the InodeTable
+	InodeObjectCount               uint64                          // Number of Objects holding {Dir|File}Inode Payload-described B+Tree as well as the FileInode's contents
+	InodeObjectSize                uint64                          // Sum of sizes of all Objects holding {Dir|File}Inode Payload-described B+Tree as well as the FileInode's contents
+	InodeBytesReferenced           uint64                          // Sum of bytes referenced in all Objects holding {Dir|File}Inode Payload-described B+Tree as well as the FileInode's contents
+	PendingDeleteObjectNumberArray []uint64                        // List of Objects to be deleted after the this CheckPoint
 }
 
 // MarshalSuperBlockV1 encodes superBlockV1 to superBlockV1Buf.
@@ -232,7 +256,8 @@ func UnmarshalInodeTableEntryValueVersion(inodeTableEntryValueBuf []byte) (inode
 //
 // The struct is serialized as a sequence of LittleEndian formatted fields.
 //
-// Note that there is no InodeTableEntryKeyV1Struct as it is simply a uint64 InodeNumber.
+// Note that there is no InodeTableEntryKeyV1Struct as it is simply an InodeNumber uint64
+// serialized in LittleEndian format.
 //
 type InodeTableEntryValueV1Struct struct {
 	InodeHeadObjectNumber uint64 // Identifies the Object containing InodeHeadV*Struct
@@ -248,8 +273,8 @@ func (inodeTableEntryValueV1 *InodeTableEntryValueV1Struct) MarshalInodeTableEnt
 
 // UnmarshalInodeTableEntryValueV1 decodes inodeTableEntryValueV1 from inodeTableEntryValueV1Buf.
 //
-func UnmarshalInodeTableEntryValueV1(inodeTableEntryValueV1Buf []byte) (inodeTableEntryValueV1 *InodeTableEntryValueV1Struct, err error) {
-	inodeTableEntryValueV1, err = unmarshalInodeTableEntryValueV1(inodeTableEntryValueV1Buf)
+func UnmarshalInodeTableEntryValueV1(inodeTableEntryValueV1Buf []byte) (inodeTableEntryValueV1 *InodeTableEntryValueV1Struct, bytesConsumed int, err error) {
+	inodeTableEntryValueV1, bytesConsumed, err = unmarshalInodeTableEntryValueV1(inodeTableEntryValueV1Buf)
 	return
 }
 
@@ -337,28 +362,27 @@ type InodeHeadLayoutEntryV1Struct struct {
 //     specified in the table entry struct.
 //   For time.Time fields, a uint64 in LittleEndian is used to hold the UnixNano() equivalent.
 //
-// Note that the InodeTableEntryValueV1Struct.InodeHeadLength also includes the bytes for
+// Note that the SuperBlockV1Struct.InodeTableRootObjectLength also includes the bytes for
 // holding the ObjectTrailerStruct{ObjType: InodeHeadType, Version: InodeHeadVersionV1}
 // that is appended.
 //
 type InodeHeadV1Struct struct {
-	InodeNumber         uint64
-	InodeType           uint8                       //    One of InodeType*
-	LinkTable           []InodeLinkTableEntryStruct //    List of Directory Entry references to this Inode
-	Size                uint64                      //    Only applicable to File Inodes
-	CreationTime        time.Time
-	ModificationTime    time.Time
-	AccessTime          time.Time
-	AttrChangeTime      time.Time
-	Mode                uint16 //                         Must be <= InodeModeMask (Note: does not include InodeType encoding)
-	UserID              uint64
-	GroupID             uint64
+	InodeNumber         uint64                         //
+	InodeType           uint8                          // One of InodeType*
+	LinkTable           []InodeLinkTableEntryStruct    // List of Directory Entry references to this Inode
+	Size                uint64                         // Only applicable to File Inodes
+	ModificationTime    time.Time                      // In POSIX terms, equivalent to st_mtim: Time of last modification
+	StatusChangeTime    time.Time                      // In POSIX terms, equivalent to st_ctim: Time of last status change
+	Mode                uint16                         // Must be <= InodeModeMask (Note: does not include InodeType encoding)
+	UserID              uint64                         //
+	GroupID             uint64                         //
 	StreamTable         []InodeStreamTableEntryStruct  // List of Alternate Data Streams for this Inode
 	PayloadObjectNumber uint64                         // For Dir & File Inodes, identifies the Object containing the root of the Directory or ExtentMap B+Tree
 	PayloadObjectOffset uint64                         // For Dir & File Inodes, starting offset in the Object of the root of the Directory or ExtentMap B+Tree
 	PayloadObjectLength uint64                         // For Dir & File Inodes, number of bytes in the Object of the root of the Directory or ExtentMap B+Tree
 	SymLinkTarget       string                         // For SymLink Inodes, the target of the link
-	Layout              []InodeHeadLayoutEntryV1Struct // Describes the data and space occupied by the the InodeTable
+	Layout              []InodeHeadLayoutEntryV1Struct // For Dir  Inodes, describes the data and space occupied by the Payload-described B+Tree
+	//                                                    For File Inodes, describes the data and space occupied by the Payload-described B+Tree as well as the File's contents
 }
 
 // MarshalInodeHeadV1 encodes inodeHeadV1 to inodeHeadV1Buf.
@@ -380,8 +404,8 @@ func UnmarshalInodeHeadV1(inodeHeadV1Buf []byte) (inodeHeadV1 *InodeHeadV1Struct
 //
 // The struct is serialized as a sequence of uint* fields in LittleEndian format.
 //
-// Note that there is no DirectoryEntryKeyV1Struct as it is simply a string serialized
-// by a uint64 length in LittleEndian format followed by the bytes of the string.
+// Note that there is no DirectoryEntryKeyV1Struct as it is simply a BaseName string
+// serialized by a uint64 length in LittleEndian format followed by the bytes of the string.
 //
 type DirectoryEntryValueV1Struct struct {
 	InodeNumber uint64
@@ -397,8 +421,8 @@ func (directoryEntryValueV1 *DirectoryEntryValueV1Struct) MarshalDirectoryEntryV
 
 // UnmarshalDirectoryEntryValueV1 decodes directoryEntryValueV1 from directoryEntryValueV1Buf.
 //
-func UnmarshalDirectoryEntryValueV1(directoryEntryValueV1Buf []byte) (directoryEntryValueV1 *DirectoryEntryValueV1Struct, err error) {
-	directoryEntryValueV1, err = unmarshalDirectoryEntryValueV1(directoryEntryValueV1Buf)
+func UnmarshalDirectoryEntryValueV1(directoryEntryValueV1Buf []byte) (directoryEntryValueV1 *DirectoryEntryValueV1Struct, bytesConsumed int, err error) {
+	directoryEntryValueV1, bytesConsumed, err = unmarshalDirectoryEntryValueV1(directoryEntryValueV1Buf)
 	return
 }
 
@@ -407,11 +431,10 @@ func UnmarshalDirectoryEntryValueV1(directoryEntryValueV1Buf []byte) (directoryE
 //
 // The struct is serialized as a sequence of uint64 fields in LittleEndian format.
 //
-// Note that there is no ExtentMapEntryKeyV1Struct as it is simply a uint64 serialized
-// in LittleEndian format.
+// Note that there is no ExtentMapEntryKeyV1Struct as it is simply a FileOffset uint64
+// serialized in LittleEndian format.
 //
 type ExtentMapEntryValueV1Struct struct {
-	FileOffset   uint64 // Offset from the start of the File
 	Length       uint64 // Length of this extent (both in the File and in the Object)
 	ObjectNumber uint64 // Identifies the Object containing this extent's data
 	ObjectOffset uint64 // Starting offset in the Object of this extent's data
@@ -426,8 +449,8 @@ func (extentMapEntryValueV1 *ExtentMapEntryValueV1Struct) MarshalExtentMapEntryV
 
 // UnmarshalExtentMapEntryValueV1 decodes directoryEntryValueV1 from directoryEntryValueV1Buf.
 //
-func UnmarshalExtentMapEntryValueV1(extentMapEntryValueV1Buf []byte) (extentMapEntryValueV1 *ExtentMapEntryValueV1Struct, err error) {
-	extentMapEntryValueV1, err = unmarshalExtentMapEntryValueV1(extentMapEntryValueV1Buf)
+func UnmarshalExtentMapEntryValueV1(extentMapEntryValueV1Buf []byte) (extentMapEntryValueV1 *ExtentMapEntryValueV1Struct, bytesConsumed int, err error) {
+	extentMapEntryValueV1, bytesConsumed, err = unmarshalExtentMapEntryValueV1(extentMapEntryValueV1Buf)
 	return
 }
 
@@ -569,5 +592,43 @@ func GetFixedByteSliceFromBuf(buf []byte, curPos int, byteSlice []byte) (nextPos
 //
 func PutFixedByteSliceToBuf(buf []byte, curPos int, byteSlice []byte) (nextPos int, err error) {
 	nextPos, err = putFixedByteSliceToBuf(buf, curPos, byteSlice)
+	return
+}
+
+// GetObjectNameAsByteSlice returns the isomorphically mapped objectName as
+// a []byte given a uint64 objectNumber.
+//
+func GetObjectNameAsByteSlice(objectNumber uint64) (objectName []byte) {
+	objectName = getObjectNameAsByteSlice(objectNumber)
+	return
+}
+
+// GetObjectNameAsString returns the isomorphically mapped objectName as
+// a string given a uint64 objectNumber.
+//
+func GetObjectNameAsString(objectNumber uint64) (objectName string) {
+	objectName = getObjectNameAsString(objectNumber)
+	return
+}
+
+// GetObjectNumberFromByteSlice returns the isomorphically mapped uint64 objectNumber
+// given a []byte objectName.
+//
+// An error will result if objectName is not of the proper length or contains
+// invalid characters.
+//
+func GetObjectNumberFromByteSlice(objectName []byte) (objectNumber uint64, err error) {
+	objectNumber, err = getObjectNumberFromByteSlice(objectName)
+	return
+}
+
+// GetObjectNumberFromString returns the isomorphically mapped uint64 objectNumber
+// given a string objectName.
+//
+// An error will result if objectName is not of the proper length or contains
+// invalid characters.
+//
+func GetObjectNumberFromString(objectName string) (objectNumber uint64, err error) {
+	objectNumber, err = getObjectNumberFromString(objectName)
 	return
 }

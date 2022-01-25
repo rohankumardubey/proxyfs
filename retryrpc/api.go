@@ -11,20 +11,22 @@ package retryrpc
 // a response.
 
 import (
+	"bytes"
 	"container/list"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"log"
 	"net"
 	"reflect"
 	"strconv"
 	"sync"
 	"time"
 
-	"github.com/NVIDIA/proxyfs/bucketstats"
-	"github.com/NVIDIA/proxyfs/logger"
 	"github.com/google/btree"
+
+	"github.com/NVIDIA/proxyfs/bucketstats"
 )
 
 // Server tracks the state of the server
@@ -33,7 +35,7 @@ type Server struct {
 	completedLongTTL time.Duration          // How long a completed request stays on queue
 	completedAckTrim time.Duration          // How frequently trim requests acked by client
 	svrMap           map[string]*methodArgs // Key: Method name
-	ipaddr           string                 // IP address server listens too
+	dnsOrIpaddr      string                 // DNS or IP address server listens too
 	port             int                    // Port of server
 	clientIDNonce    uint64                 // Nonce used to create a unique client ID
 	netListener      net.Listener           // Accepts on this to skip TLS upgrade
@@ -54,27 +56,39 @@ type Server struct {
 	deadlineIO           time.Duration
 	keepAlivePeriod      time.Duration
 	completedDoneWG      sync.WaitGroup
-	dontStartTrimmers    bool // Used for testing
+	logger               *log.Logger // If nil, defaults to log.New()
+	dontStartTrimmers    bool        // Used for testing
 }
 
 // ServerConfig is used to configure a retryrpc Server
 type ServerConfig struct {
 	LongTrim          time.Duration   // How long the results of an RPC are stored on a Server before removed
 	ShortTrim         time.Duration   // How frequently completed and ACKed RPCs results are removed from Server
-	IPAddr            string          // IP Address that Server uses to listen
+	DNSOrIPAddr       string          // DNS or IP Address that Server uses to listen
 	Port              int             // Port that Server uses to listen
 	DeadlineIO        time.Duration   // How long I/Os on sockets wait even if idle
 	KeepAlivePeriod   time.Duration   // How frequently a KEEPALIVE is sent
 	TLSCertificate    tls.Certificate // TLS Certificate to present to Clients (or tls.Certificate{} if using TCP)
+	Logger            *log.Logger     // If nil, defaults to log.New()
 	dontStartTrimmers bool            // Used for testing
 }
 
 // NewServer creates the Server object
 func NewServer(config *ServerConfig) *Server {
-	server := &Server{ipaddr: config.IPAddr, port: config.Port, completedLongTTL: config.LongTrim,
-		completedAckTrim: config.ShortTrim, deadlineIO: config.DeadlineIO,
-		keepAlivePeriod: config.KeepAlivePeriod, dontStartTrimmers: config.dontStartTrimmers,
-		tlsCertificate: config.TLSCertificate}
+	server := &Server{
+		dnsOrIpaddr:       config.DNSOrIPAddr,
+		port:              config.Port,
+		completedLongTTL:  config.LongTrim,
+		completedAckTrim:  config.ShortTrim,
+		deadlineIO:        config.DeadlineIO,
+		keepAlivePeriod:   config.KeepAlivePeriod,
+		dontStartTrimmers: config.dontStartTrimmers,
+		logger:            config.Logger,
+		tlsCertificate:    config.TLSCertificate}
+	if server.logger == nil {
+		var logBuf bytes.Buffer
+		server.logger = log.New(&logBuf, "", 0)
+	}
 	server.svrMap = make(map[string]*methodArgs)
 	server.perClientInfo = make(map[uint64]*clientInfo)
 	server.completedTickerDone = make(chan bool)
@@ -92,7 +106,7 @@ func (server *Server) Register(retrySvr interface{}) (err error) {
 
 // Start listener
 func (server *Server) Start() (err error) {
-	hostPortStr := net.JoinHostPort(server.ipaddr, fmt.Sprintf("%d", server.port))
+	hostPortStr := net.JoinHostPort(server.dnsOrIpaddr, fmt.Sprintf("%d", server.port))
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{server.tlsCertificate},
@@ -172,7 +186,7 @@ func (server *Server) SendCallback(clientID uint64, msg []byte) {
 	server.Lock()
 	lci, ok := server.perClientInfo[clientID]
 	if !ok {
-		fmt.Printf("SERVER: SendCallback() - unable to find client UniqueID: %v\n", clientID)
+		server.logger.Printf("SERVER: SendCallback() - unable to find client UniqueID: %v\n", clientID)
 		server.Unlock()
 		return
 	}
@@ -197,12 +211,12 @@ func (server *Server) Close() {
 	if len(server.tlsCertificate.Certificate) == 0 {
 		err := server.netListener.Close()
 		if err != nil {
-			logger.Errorf("server.netListener.Close() returned err: %v", err)
+			server.logger.Printf("server.netListener.Close() returned err: %v\n", err)
 		}
 	} else {
 		err := server.tlsListener.Close()
 		if err != nil {
-			logger.Errorf("server.tlsListener.Close() returned err: %v", err)
+			server.logger.Printf("server.tlsListener.Close() returned err: %v\n", err)
 		}
 	}
 
@@ -298,26 +312,29 @@ type Client struct {
 	// trimmed
 	bt          *btree.BTree   // btree of requestID's acked
 	goroutineWG sync.WaitGroup // Used to track outstanding goroutines
+	logger      *log.Logger    // If nil, defaults to log.New()
 	stats       clientSideStatsInfo
 }
 
 // ClientCallbacks contains the methods required when supporting
 // callbacks from the Server.
+//
+// NOTE: It is assumed that ALL Interrupt() routines will eventually
+// return.   Failure to do so will cause client.Close() to hang!
 type ClientCallbacks interface {
 	Interrupt(payload []byte)
 }
 
 // ClientConfig is used to configure a retryrpc Client
 type ClientConfig struct {
-	IPAddr                   string        // IP Address of Server
+	DNSOrIPAddr              string        // DNS name or IP Address of Server
 	Port                     int           // Port of Server
 	RootCAx509CertificatePEM []byte        // If TLS...Root certificate; If TCP... nil
 	Callbacks                interface{}   // Structure implementing ClientCallbacks
 	DeadlineIO               time.Duration // How long I/Os on sockets wait even if idle
 	KeepAlivePeriod          time.Duration // How frequently a KEEPALIVE is sent
+	Logger                   *log.Logger   // If nil, defaults to log.New()
 }
-
-// TODO - pass loggers to Cient and Server objects
 
 // NewClient returns a Client structure
 //
@@ -335,11 +352,17 @@ func NewClient(config *ClientConfig) (client *Client, err error) {
 	client = &Client{
 		connection: &connectionTracker{
 			state:       INITIAL,
-			hostPortStr: net.JoinHostPort(config.IPAddr, fmt.Sprintf("%d", config.Port)),
+			hostPortStr: net.JoinHostPort(config.DNSOrIPAddr, fmt.Sprintf("%d", config.Port)),
 		},
 		cb:              config.Callbacks,
 		keepAlivePeriod: config.KeepAlivePeriod,
 		deadlineIO:      config.DeadlineIO,
+		logger:          config.Logger,
+	}
+
+	if client.logger == nil {
+		var logBuf bytes.Buffer
+		client.logger = log.New(&logBuf, "", 0)
 	}
 
 	client.outstandingRequest = make(map[requestID]*reqCtx)

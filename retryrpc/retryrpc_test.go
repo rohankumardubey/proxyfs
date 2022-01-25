@@ -4,9 +4,11 @@
 package retryrpc
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509/pkix"
 	"fmt"
+	"log"
 	"net"
 	"strconv"
 	"testing"
@@ -31,7 +33,14 @@ type testTLSCertsStruct struct {
 	endpointTLSCert      tls.Certificate
 }
 
-var testTLSCerts *testTLSCertsStruct
+func newLogger() *log.Logger {
+	return log.New(&logBuf, "", 0)
+}
+
+var (
+	logBuf       bytes.Buffer
+	testTLSCerts *testTLSCertsStruct
+)
 
 // Utility function to initialize testTLSCerts
 func testTLSCertsAllocate(t *testing.T) {
@@ -75,6 +84,7 @@ func testTLSCertsAllocate(t *testing.T) {
 		testTLSCerts.caKeyPEMBlock,
 		"",
 		"")
+
 	if nil != err {
 		t.Fatalf("icertpkg.genEndpointCert() failed: %v", err)
 	}
@@ -114,22 +124,24 @@ func getNewServer(lt time.Duration, dontStartTrimmers bool, useTLS bool) (rrSvr 
 		config = &ServerConfig{
 			LongTrim:          lt,
 			ShortTrim:         100 * time.Millisecond,
-			IPAddr:            testIPAddr,
+			DNSOrIPAddr:       testIPAddr,
 			Port:              testPort,
 			DeadlineIO:        60 * time.Second,
 			KeepAlivePeriod:   60 * time.Second,
 			TLSCertificate:    testTLSCerts.endpointTLSCert,
+			Logger:            newLogger(),
 			dontStartTrimmers: dontStartTrimmers,
 		}
 	} else {
 		config = &ServerConfig{
 			LongTrim:          lt,
 			ShortTrim:         100 * time.Millisecond,
-			IPAddr:            testIPAddr,
+			DNSOrIPAddr:       testIPAddr,
 			Port:              testPort,
 			DeadlineIO:        60 * time.Second,
 			KeepAlivePeriod:   60 * time.Second,
 			TLSCertificate:    tls.Certificate{},
+			Logger:            newLogger(),
 			dontStartTrimmers: dontStartTrimmers,
 		}
 	}
@@ -193,21 +205,23 @@ func testServer(t *testing.T, useTLS bool) {
 	// Now - setup a client to send requests to the server
 	if useTLS {
 		clientConfig = &ClientConfig{
-			IPAddr:                   testIPAddr,
+			DNSOrIPAddr:              testIPAddr,
 			Port:                     testPort,
 			RootCAx509CertificatePEM: testTLSCerts.caCertPEMBlock,
 			Callbacks:                nil,
 			DeadlineIO:               60 * time.Second,
 			KeepAlivePeriod:          60 * time.Second,
+			Logger:                   newLogger(),
 		}
 	} else {
 		clientConfig = &ClientConfig{
-			IPAddr:                   testIPAddr,
+			DNSOrIPAddr:              testIPAddr,
 			Port:                     testPort,
 			RootCAx509CertificatePEM: nil,
 			Callbacks:                nil,
 			DeadlineIO:               60 * time.Second,
 			KeepAlivePeriod:          60 * time.Second,
+			Logger:                   newLogger(),
 		}
 	}
 	rrClnt, newErr := NewClient(clientConfig)
@@ -266,21 +280,23 @@ func testBtree(t *testing.T, useTLS bool) {
 	// Setup a client - we only will be targeting the btree
 	if useTLS {
 		clientConfig = &ClientConfig{
-			IPAddr:                   testIPAddr,
+			DNSOrIPAddr:              testIPAddr,
 			Port:                     testPort,
 			RootCAx509CertificatePEM: testTLSCerts.caCertPEMBlock,
 			Callbacks:                nil,
 			DeadlineIO:               60 * time.Second,
 			KeepAlivePeriod:          60 * time.Second,
+			Logger:                   newLogger(),
 		}
 	} else {
 		clientConfig = &ClientConfig{
-			IPAddr:                   testIPAddr,
+			DNSOrIPAddr:              testIPAddr,
 			Port:                     testPort,
 			RootCAx509CertificatePEM: nil,
 			Callbacks:                nil,
 			DeadlineIO:               60 * time.Second,
 			KeepAlivePeriod:          60 * time.Second,
+			Logger:                   newLogger(),
 		}
 	}
 	client, newErr := NewClient(clientConfig)

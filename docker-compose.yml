@@ -1,0 +1,150 @@
+# Copyright (c) 2015-2022, NVIDIA CORPORATION.
+# SPDX-License-Identifier: Apache-2.0
+
+# To build the `development` service
+#
+#   docker compose build [--build-arg GolangVersion=<X.YY.Z>] [--build-arg MakeTarget={|all|ci|minimal}]
+#
+#   Notes:
+#     --build-arg Key=Value settings passed on to Dockerfile
+#     Images built will be named "proxyfs_<service>:latest"
+#     Use docker tag SOURCE_IMAGE[:TAG] TARGET_IMAGE[:TAG] to create an alias
+#
+# To run the resultant application:
+#
+#   docker compose up [-d|--detach] {dev|ickpt|imgr|iclient}
+#
+#   Notes:
+#     -d|--detach:
+#       1) tells docker compose to detach from running containers
+#       2) if supplied:
+#          a) stop application with `docker compose down`
+#          b) containers are removed upon application down
+#       3) if not supplied:
+#          a) stop application with ^C
+#          b) containers are left in "exited" state upon application down
+#     dev:     tells docker compose to only bring up dev     service (w/ dependencies)
+#     ickpt:   tells docker compose to only bring up ickpt   service (w/ dependencies)
+#     imgr:    tells docker compose to only bring up imgr    service (w/ dependencies)
+#     iclient: tells docker compose to only bring up iclient service (w/ dependencies)
+#     Precisely one of {dev|ickpt|imgr|iclient} must be specied...
+#       If no service is specified, dev published ports will collide with other services
+#     Containers launched have been named the same as their corresponding service name
+#
+# To stop the resultant application:
+#
+#   docker compose down
+
+version: '3.8'
+
+services:
+  swift:
+    image: dockerswiftaio/docker-swift:2.27.0
+    container_name: proxyfs_swift
+    expose:
+      - 8080                                  # curl http://swift:8080/info
+    ports:
+      - target: 8080
+        published: 8080
+        protocol: tcp
+        mode: host
+  dev:
+    build:
+      context: .
+      target: dev
+    container_name: proxyfs_dev
+    depends_on:
+      - swift
+    privileged: true
+    expose:
+      - 33123                                 # ICKPT.Port
+      - 32356                                 # IMGR.RetryRPCPort
+      - 15346                                 # IMGR.HTTPServerPort
+      - 15347                                 # ICLIENT.HTTPServerPort for iclient/dev.conf
+      - 15348                                 # ICLIENT.HTTPServerPort for iclient/dev2.conf
+      - 15349                                 # ICLIENT.HTTPServerPort for iclient/dev3.conf
+    ports:
+      - target: 33123
+        published: 33123
+        protocol: tcp
+        mode: host
+      - target: 32356
+        published: 32356
+        protocol: tcp
+        mode: host
+      - target: 15346
+        published: 15346
+        protocol: tcp
+        mode: host
+      - target: 15347
+        published: 15347
+        protocol: tcp
+        mode: host
+      - target: 15348
+        published: 15348
+        protocol: tcp
+        mode: host
+      - target: 15349
+        published: 15349
+        protocol: tcp
+        mode: host
+    volumes:
+      - type: bind
+        source: .
+        target: /src
+    command: ["sleep", "infinity"]
+  ickpt:
+    build:
+      context: .
+      target: deploy
+    container_name: proxyfs_ickpt
+    depends_on:
+      - swift
+    privileged: true
+    expose:
+      - 33123                                 # ICKPT.Port
+    ports:
+      - target: 33123
+        published: 33123
+        protocol: tcp
+        mode: host
+    command: ["./ickpt", "ickpt.conf"]
+  imgr:
+    build:
+      context: .
+      target: deploy
+    container_name: proxyfs_imgr
+    depends_on:
+      - swift
+      - ickpt
+    expose:
+      - 32356                                 # IMGR.RetryRPCPort
+      - 15346                                 # IMGR.HTTPServerPort
+    ports:
+      - target: 32356
+        published: 32356
+        protocol: tcp
+        mode: host
+      - target: 15346
+        published: 15346
+        protocol: tcp
+        mode: host
+    command: ["./imgr", "imgr.conf"]
+  iclient:
+    build:
+      context: .
+      target: deploy
+    container_name: proxyfs_iclient
+    depends_on:
+      - swift
+      - imgr
+    privileged: true
+    expose:
+      - 15347                                 # ICLIENT.HTTPServerPort
+    ports:
+      - target: 15347
+        published: 15347
+        protocol: tcp
+        mode: host
+    command: ["./iclient.sh", "-fs"]
+ 

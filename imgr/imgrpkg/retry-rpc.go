@@ -1,9 +1,10 @@
-// Copyright (c) 2015-2021, NVIDIA CORPORATION.
+// Copyright (c) 2015-2022, NVIDIA CORPORATION.
 // SPDX-License-Identifier: Apache-2.0
 
 package imgrpkg
 
 import (
+	"container/list"
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
@@ -11,7 +12,6 @@ import (
 
 	"github.com/NVIDIA/sortedmap"
 
-	"github.com/NVIDIA/proxyfs/blunder"
 	"github.com/NVIDIA/proxyfs/ilayout"
 	"github.com/NVIDIA/proxyfs/retryrpc"
 	"github.com/NVIDIA/proxyfs/utils"
@@ -23,9 +23,9 @@ func startRetryRPCServer() (err error) {
 		tlsCertificate       tls.Certificate
 	)
 
-	if "" == globals.config.RetryRPCCertFilePath { // && "" == globals.config.RetryRPCKeyFilePath
+	if globals.config.RetryRPCCertFilePath == "" { // && globals.config.RetryRPCKeyFilePath == ""
 		tlsCertificate = tls.Certificate{}
-	} else { // ("" != globals.config.RetryRPCCertFilePath) && ("" != globals.config.RetryRPCKeyFilePath)
+	} else { // (globals.config.RetryRPCCertFilePath != "") && (globals.config.RetryRPCKeyFilePath != "")
 		tlsCertificate, err = tls.LoadX509KeyPair(globals.config.RetryRPCCertFilePath, globals.config.RetryRPCKeyFilePath)
 		if nil != err {
 			return
@@ -35,7 +35,7 @@ func startRetryRPCServer() (err error) {
 	retryrpcServerConfig = &retryrpc.ServerConfig{
 		LongTrim:        globals.config.RetryRPCTTLCompleted,
 		ShortTrim:       globals.config.RetryRPCAckTrim,
-		IPAddr:          globals.config.PublicIPAddr,
+		DNSOrIPAddr:     globals.config.PublicIPAddr,
 		Port:            int(globals.config.RetryRPCPort),
 		DeadlineIO:      globals.config.RetryRPCDeadlineIO,
 		KeepAlivePeriod: globals.config.RetryRPCKeepAlivePeriod,
@@ -73,20 +73,31 @@ func stopRetryRPCServer() (err error) {
 
 func mount(retryRPCClientID uint64, mountRequest *MountRequestStruct, mountResponse *MountResponseStruct) (err error) {
 	var (
-		alreadyInGlobalsMountMap  bool
-		lastCheckPoint            *ilayout.CheckPointV1Struct
-		lastCheckPointAsByteSlice []byte
-		lastCheckPointAsString    string
-		mount                     *mountStruct
-		mountIDAsByteArray        []byte
-		mountIDAsString           string
-		ok                        bool
-		startTime                 time.Time
-		volume                    *volumeStruct
-		volumeAsValue             sortedmap.Value
+		alreadyInGlobalsMountMap            bool
+		inodeTableEntryInMemory             *inodeTableLayoutElementStruct
+		inodeTableEntryOnDisk               ilayout.InodeTableLayoutEntryV1Struct
+		lastCheckPoint                      *ilayout.CheckPointV1Struct
+		lastCheckPointAsByteSlice           []byte
+		lastCheckPointAsString              string
+		mount                               *mountStruct
+		mountIDAsByteArray                  []byte
+		mountIDAsString                     string
+		ok                                  bool
+		superBlockPendingDeleteObjectNumber uint64
+		startTime                           time.Time = time.Now()
+		superBlockAsByteSlice               []byte
+		volume                              *volumeStruct
+		volumeAsValue                       sortedmap.Value
 	)
 
-	startTime = time.Now()
+	logTracef("==> [RPC] Mount(retryRPCClientID: 0x%016X, mountRequest: %+v,)", retryRPCClientID, mountRequest)
+	defer func() {
+		if err == nil {
+			logTracef("<== [RPC] Mount(retryRPCClientID: 0x%016X, mountRequest: %+v,mountResponse: %+v)", retryRPCClientID, mountRequest, mountResponse)
+		} else {
+			logTracef("<== [RPC] Mount(retryRPCClientID: 0x%016X, mountRequest: %+v,) failed: %v", retryRPCClientID, mountRequest, err)
+		}
+	}()
 
 	defer func() {
 		globals.stats.MountUsecs.Add(uint64(time.Since(startTime) / time.Microsecond))
@@ -109,23 +120,31 @@ func mount(retryRPCClientID uint64, mountRequest *MountRequestStruct, mountRespo
 		logFatalf("volumeAsValue.(*volumeStruct) returned !ok")
 	}
 
-	volume.Lock()
-
 	if volume.deleting {
-		volume.Unlock()
 		globals.Unlock()
 		err = fmt.Errorf("%s %s", EVolumeBeingDeleted, mountRequest.VolumeName)
 		return
 	}
 
-	lastCheckPointAsByteSlice, err = swiftObjectGet(volume.storageURL, mountRequest.AuthToken, ilayout.CheckPointObjectNumber)
+	lastCheckPointAsByteSlice, err = checkPointRead(volume.storageURL, mountRequest.AuthToken)
 	if nil != err {
-		volume.Unlock()
 		globals.Unlock()
 		err = fmt.Errorf("%s %s", EAuthTokenRejected, mountRequest.AuthToken)
 		return
 	}
 	lastCheckPointAsString = string(lastCheckPointAsByteSlice[:])
+
+	lastCheckPoint, err = ilayout.UnmarshalCheckPointV1(lastCheckPointAsString)
+	if nil != err {
+		logFatalf("ilayout.UnmarshalCheckPointV1(lastCheckPointAsString==\"%s\") failed: %v", lastCheckPointAsString, err)
+	}
+
+	superBlockAsByteSlice, err = swiftObjectGetTail(volume.storageURL, mountRequest.AuthToken, lastCheckPoint.SuperBlockObjectNumber, lastCheckPoint.SuperBlockLength)
+	if nil != err {
+		globals.Unlock()
+		err = fmt.Errorf("%s %s", EAuthTokenRejected, mountRequest.AuthToken)
+		return
+	}
 
 retryGenerateMountID:
 
@@ -138,34 +157,60 @@ retryGenerateMountID:
 	}
 
 	mount = &mountStruct{
-		volume:           volume,
-		mountID:          mountIDAsString,
-		leasesExpired:    false,
-		authTokenExpired: false,
-		authToken:        mountRequest.AuthToken,
-		lastAuthTime:     time.Now(),
+		volume:                 volume,
+		mountID:                mountIDAsString,
+		retryRPCClientID:       retryRPCClientID,
+		acceptingLeaseRequests: true,
+		leaseRequestMap:        make(map[uint64]*leaseRequestStruct),
+		leasesExpired:          false,
+		authTokenExpired:       false,
+		authToken:              mountRequest.AuthToken,
+		lastAuthTime:           startTime,
+		mountListMembership:    onHealthyMountList,
+		inodeOpenMap:           make(map[uint64]uint64),
 	}
 
 	volume.mountMap[mountIDAsString] = mount
-	mount.listElement = volume.healthyMountList.PushBack(mount)
+	mount.mountListElement = volume.healthyMountList.PushBack(mount)
 	globals.mountMap[mountIDAsString] = mount
 
 	if nil == volume.checkPointControlChan {
-		lastCheckPoint, err = ilayout.UnmarshalCheckPointV1(lastCheckPointAsString)
+		volume.checkPoint = lastCheckPoint
+
+		volume.superBlock, err = ilayout.UnmarshalSuperBlockV1(superBlockAsByteSlice)
 		if nil != err {
-			logFatalf("ilayout.UnmarshalCheckPointV1(lastCheckPointAsString==\"%s\") failed: %v", lastCheckPointAsString, err)
+			logFatalf("ilayout.UnmarshalSuperBlockV1(superBlockAsByteSlice) failed: %v", err)
 		}
 
-		volume.checkPoint = lastCheckPoint
+		volume.inodeTable, err = sortedmap.OldBPlusTree(volume.superBlock.InodeTableRootObjectNumber, volume.superBlock.InodeTableRootObjectOffset, volume.superBlock.InodeTableRootObjectLength, sortedmap.CompareUint64, volume, globals.inodeTableCache)
+		if nil != err {
+			logFatalf("sortedmap.OldBPlusTree(volume.superBlock.InodeTableRootObjectNumber, volume.superBlock.InodeTableRootObjectOffset, volume.superBlock.InodeTableRootObjectLength, sortedmap.CompareUint64, volume, globals.inodeTableCache) failed: %v", err)
+		}
+
+		volume.inodeTableLayout = make(map[uint64]*inodeTableLayoutElementStruct)
+
+		for _, inodeTableEntryOnDisk = range volume.superBlock.InodeTableLayout {
+			inodeTableEntryInMemory = &inodeTableLayoutElementStruct{
+				objectSize:      inodeTableEntryOnDisk.ObjectSize,
+				bytesReferenced: inodeTableEntryOnDisk.BytesReferenced,
+			}
+
+			volume.inodeTableLayout[inodeTableEntryOnDisk.ObjectNumber] = inodeTableEntryInMemory
+		}
+
+		for _, superBlockPendingDeleteObjectNumber = range volume.superBlock.PendingDeleteObjectNumberArray {
+			volume.pendingDeleteObjectNumberList.PushBack(superBlockPendingDeleteObjectNumber)
+		}
 
 		volume.checkPointControlChan = make(chan chan error)
 
+		volume.checkPointObjectNumber = lastCheckPoint.SuperBlockObjectNumber
+
 		volume.checkPointControlWG.Add(1)
 
-		go volume.checkPointDaemon(volume.checkPointControlChan)
+		go volume.checkPointDaemon()
 	}
 
-	volume.Unlock()
 	globals.Unlock()
 
 	mountResponse.MountID = mountIDAsString
@@ -176,24 +221,94 @@ retryGenerateMountID:
 
 func renewMount(renewMountRequest *RenewMountRequestStruct, renewMountResponse *RenewMountResponseStruct) (err error) {
 	var (
-		startTime time.Time
+		mount     *mountStruct
+		ok        bool
+		startTime time.Time = time.Now()
 	)
 
-	startTime = time.Now()
+	logTracef("==> [RPC] RenewMount(renewMountRequest: %+v,)", renewMountRequest)
+	defer func() {
+		if err == nil {
+			logTracef("<== [RPC] RenewMount(renewMountRequest: %+v, renewMountResponse: %+v)", renewMountRequest, renewMountResponse)
+		} else {
+			logTracef("<== [RPC] RenewMount(renewMountRequest: %+v,) failed: %v", renewMountRequest, err)
+		}
+	}()
 
 	defer func() {
 		globals.stats.RenewMountUsecs.Add(uint64(time.Since(startTime) / time.Microsecond))
 	}()
 
-	return fmt.Errorf(ETODO + " renewMount")
+	globals.Lock()
+
+	mount, ok = globals.mountMap[renewMountRequest.MountID]
+	if !ok {
+		globals.Unlock()
+		err = fmt.Errorf("%s %s", EUnknownMountID, renewMountRequest.MountID)
+		return
+	}
+
+	mount.authToken = renewMountRequest.AuthToken
+
+	if checkAuthToken(mount.volume.storageURL, mount.authToken) {
+		mount.authTokenExpired = false
+
+		switch mount.mountListMembership {
+		case onHealthyMountList:
+			mount.volume.healthyMountList.MoveToBack(mount.mountListElement)
+		case onLeasesExpiredMountList:
+			mount.volume.leasesExpiredMountList.MoveToBack(mount.mountListElement)
+		case onAuthTokenExpiredMountList:
+			_ = mount.volume.authTokenExpiredMountList.Remove(mount.mountListElement)
+			if mount.leasesExpired {
+				mount.mountListElement = mount.volume.leasesExpiredMountList.PushBack(mount)
+				mount.mountListMembership = onLeasesExpiredMountList
+			} else {
+				mount.mountListElement = mount.volume.healthyMountList.PushBack(mount)
+				mount.mountListMembership = onHealthyMountList
+			}
+		default:
+			logFatalf("mount.mountListMembership (%v) not one of on{Healthy|LeasesExpired|AuthTokenExpired}MountList")
+		}
+	} else {
+		err = fmt.Errorf("%s %s", EAuthTokenRejected, renewMountRequest.AuthToken)
+
+		mount.authTokenExpired = true
+
+		switch mount.mountListMembership {
+		case onHealthyMountList:
+			_ = mount.volume.healthyMountList.Remove(mount.mountListElement)
+			mount.mountListElement = mount.volume.authTokenExpiredMountList.PushBack(mount)
+			mount.mountListMembership = onAuthTokenExpiredMountList
+		case onLeasesExpiredMountList:
+			_ = mount.volume.leasesExpiredMountList.Remove(mount.mountListElement)
+			mount.mountListElement = mount.volume.authTokenExpiredMountList.PushBack(mount)
+			mount.mountListMembership = onAuthTokenExpiredMountList
+		case onAuthTokenExpiredMountList:
+			mount.volume.authTokenExpiredMountList.MoveToBack(mount.mountListElement)
+		default:
+			logFatalf("mount.mountListMembership (%v) not one of on{Healthy|LeasesExpired|AuthTokenExpired}MountList")
+		}
+	}
+
+	globals.Unlock()
+
+	return
 }
 
 func unmount(unmountRequest *UnmountRequestStruct, unmountResponse *UnmountResponseStruct) (err error) {
 	var (
-		startTime time.Time
+		startTime time.Time = time.Now()
 	)
 
-	startTime = time.Now()
+	logTracef("==> [RPC] Unmount(unmountRequest: %+v,)", unmountRequest)
+	defer func() {
+		if err == nil {
+			logTracef("<== [RPC] Unmount(unmountRequest: %+v, unmountResponse: %+v)", unmountRequest, unmountResponse)
+		} else {
+			logTracef("<== [RPC] Unmount(unmountRequest: %+v,) failed: %v", unmountRequest, err)
+		}
+	}()
 
 	defer func() {
 		globals.stats.UnmountUsecs.Add(uint64(time.Since(startTime) / time.Microsecond))
@@ -202,89 +317,431 @@ func unmount(unmountRequest *UnmountRequestStruct, unmountResponse *UnmountRespo
 	return fmt.Errorf(ETODO + " unmount")
 }
 
+func volumeStatus(volumeStatusRequest *VolumeStatusRequestStruct, volumeStatusResponse *VolumeStatusResponseStruct) (err error) {
+	var (
+		bytesReferenced uint64
+		mount           *mountStruct
+		numInodes       uint64
+		objectCount     uint64
+		objectSize      uint64
+		ok              bool
+		startTime       time.Time = time.Now()
+	)
+
+	logTracef("==> [RPC] VolumeStatus(volumeStatusRequest: %+v,)", volumeStatusRequest)
+	defer func() {
+		if err == nil {
+			logTracef("<== [RPC] VolumeStatus(volumeStatusRequest: %+v, volumeStatusResponse: %+v)", volumeStatusRequest, volumeStatusResponse)
+		} else {
+			logTracef("<== [RPC] VolumeStatus(volumeStatusRequest: %+v,) failed: %v", volumeStatusRequest, err)
+		}
+	}()
+
+	defer func() {
+		globals.stats.VolumeStatusUsecs.Add(uint64(time.Since(startTime) / time.Microsecond))
+	}()
+
+	globals.Lock()
+
+	mount, ok = globals.mountMap[volumeStatusRequest.MountID]
+	if !ok {
+		globals.Unlock()
+		err = fmt.Errorf("%s %s", EUnknownMountID, volumeStatusRequest.MountID)
+		return
+	}
+
+	if mount.authTokenHasExpired() {
+		globals.Unlock()
+		err = fmt.Errorf("%s %s", EAuthTokenRejected, mount.authToken)
+		return
+	}
+
+	numInodes, objectCount, objectSize, bytesReferenced = mount.volume.statusWhileLocked()
+
+	globals.Unlock()
+
+	volumeStatusResponse.NumInodes = numInodes
+	volumeStatusResponse.ObjectCount = objectCount
+	volumeStatusResponse.ObjectSize = objectSize
+	volumeStatusResponse.BytesReferenced = bytesReferenced
+
+	return
+}
+
 func fetchNonceRange(fetchNonceRangeRequest *FetchNonceRangeRequestStruct, fetchNonceRangeResponse *FetchNonceRangeResponseStruct) (err error) {
 	var (
 		mount     *mountStruct
 		ok        bool
-		startTime time.Time
+		startTime time.Time = time.Now()
 	)
 
-	startTime = time.Now()
+	logTracef("==> [RPC] FetchNonceRange(renewMountRequest: %+v,)", fetchNonceRangeRequest)
+	defer func() {
+		if err == nil {
+			logTracef("<== [RPC] FetchNonceRange(fetchNonceRangeRequest: %+v, fetchNonceRangeResponse: %+v)", fetchNonceRangeRequest, fetchNonceRangeResponse)
+		} else {
+			logTracef("<== [RPC] FetchNonceRange(fetchNonceRangeRequest: %+v,) failed: %v", fetchNonceRangeRequest, err)
+		}
+	}()
 
 	defer func() {
 		globals.stats.FetchNonceRangeUsecs.Add(uint64(time.Since(startTime) / time.Microsecond))
 	}()
 
-	globals.RLock()
+	globals.Lock()
 
 	mount, ok = globals.mountMap[fetchNonceRangeRequest.MountID]
 	if !ok {
-		globals.RUnlock()
-		err = fmt.Errorf("MountID not recognized")
+		globals.Unlock()
+		err = fmt.Errorf("%s %s", EUnknownMountID, fetchNonceRangeRequest.MountID)
 		return
 	}
 
-	fmt.Printf("TODO: Perform fetchNonceRange() for mountStruct @ %p\n", mount)
+	if mount.authTokenHasExpired() {
+		globals.Unlock()
+		err = fmt.Errorf("%s %s", EAuthTokenRejected, mount.authToken)
+		return
+	}
 
-	globals.RUnlock()
+	fetchNonceRangeResponse.NextNonce, fetchNonceRangeResponse.NumNoncesFetched, err = mount.volume.fetchNonceRangeWhileLocked()
 
-	return fmt.Errorf(ETODO + " fetchNonceRange")
+	globals.Unlock()
+
+	return
 }
 
 func getInodeTableEntry(getInodeTableEntryRequest *GetInodeTableEntryRequestStruct, getInodeTableEntryResponse *GetInodeTableEntryResponseStruct) (err error) {
 	var (
-		startTime time.Time
+		inodeTableEntryValue    ilayout.InodeTableEntryValueV1Struct
+		inodeTableEntryValueRaw sortedmap.Value
+		leaseRequest            *leaseRequestStruct
+		mount                   *mountStruct
+		ok                      bool
+		startTime               time.Time = time.Now()
+		volume                  *volumeStruct
 	)
 
-	startTime = time.Now()
+	logTracef("==> [RPC] GetInodeTableEntry(getInodeTableEntryRequest: %+v,)", getInodeTableEntryRequest)
+	defer func() {
+		if err == nil {
+			logTracef("<== [RPC] GetInodeTableEntry(getInodeTableEntryRequest: %+v, getInodeTableEntryResponse: %+v)", getInodeTableEntryRequest, getInodeTableEntryResponse)
+		} else {
+			logTracef("<== [RPC] GetInodeTableEntry(getInodeTableEntryRequest: %+v,) failed: %v", getInodeTableEntryRequest, err)
+		}
+	}()
 
 	defer func() {
 		globals.stats.GetInodeTableEntryUsecs.Add(uint64(time.Since(startTime) / time.Microsecond))
 	}()
 
-	return fmt.Errorf(ETODO + " getInodeTableEntry")
+	globals.Lock()
+
+	mount, ok = globals.mountMap[getInodeTableEntryRequest.MountID]
+	if !ok {
+		globals.Unlock()
+		err = fmt.Errorf("%s %s", EUnknownMountID, getInodeTableEntryRequest.MountID)
+		return
+	}
+
+	if mount.authTokenHasExpired() {
+		globals.Unlock()
+		err = fmt.Errorf("%s %s", EAuthTokenRejected, mount.authToken)
+		return
+	}
+
+	leaseRequest, ok = mount.leaseRequestMap[getInodeTableEntryRequest.InodeNumber]
+	if !ok || !leaseRequest.okToRead() {
+		globals.Unlock()
+		err = fmt.Errorf("%s %016X", EMissingLease, getInodeTableEntryRequest.InodeNumber)
+		return
+	}
+
+	volume = mount.volume
+
+	inodeTableEntryValueRaw, ok, err = volume.inodeTable.GetByKey(getInodeTableEntryRequest.InodeNumber)
+	if nil != err {
+		logFatalf("volume.inodeTable.GetByKey(getInodeTableEntryRequest.InodeNumber) failed: %v", err)
+	}
+	if !ok {
+		globals.Unlock()
+		err = fmt.Errorf("%s %016X", EUnknownInodeNumber, getInodeTableEntryRequest.InodeNumber)
+		return
+	}
+
+	inodeTableEntryValue, ok = inodeTableEntryValueRaw.(ilayout.InodeTableEntryValueV1Struct)
+	if !ok {
+		logFatalf("inodeTableEntryValueRaw.(ilayout.InodeTableEntryValueV1Struct) returned !ok")
+	}
+
+	getInodeTableEntryResponse.InodeHeadObjectNumber = inodeTableEntryValue.InodeHeadObjectNumber
+	getInodeTableEntryResponse.InodeHeadLength = inodeTableEntryValue.InodeHeadLength
+
+	globals.Unlock()
+
+	err = nil
+	return
 }
 
 func putInodeTableEntries(putInodeTableEntriesRequest *PutInodeTableEntriesRequestStruct, putInodeTableEntriesResponse *PutInodeTableEntriesResponseStruct) (err error) {
 	var (
-		startTime time.Time
+		dereferencedObjectNumber uint64
+		inodeTableEntryValue     ilayout.InodeTableEntryValueV1Struct
+		leaseRequest             *leaseRequestStruct
+		mount                    *mountStruct
+		ok                       bool
+		putInodeTableEntry       PutInodeTableEntryStruct
+		startTime                time.Time = time.Now()
+		volume                   *volumeStruct
 	)
 
-	startTime = time.Now()
+	logTracef("==> [RPC] PutInodeTableEntries(putInodeTableEntriesRequest: %+v,)", putInodeTableEntriesRequest)
+	defer func() {
+		if err == nil {
+			logTracef("<== [RPC] PutInodeTableEntries(putInodeTableEntriesRequest: %+v, putInodeTableEntriesResponse: %+v)", putInodeTableEntriesRequest, putInodeTableEntriesResponse)
+		} else {
+			logTracef("<== [RPC] PutInodeTableEntries(putInodeTableEntriesRequest: %+v,) failed: %v", putInodeTableEntriesRequest, err)
+		}
+	}()
 
 	defer func() {
 		globals.stats.PutInodeTableEntriesUsecs.Add(uint64(time.Since(startTime) / time.Microsecond))
 	}()
 
-	return fmt.Errorf(ETODO + " putInodeTableEntries")
+	globals.Lock()
+
+	mount, ok = globals.mountMap[putInodeTableEntriesRequest.MountID]
+	if !ok {
+		globals.Unlock()
+		err = fmt.Errorf("%s %s", EUnknownMountID, putInodeTableEntriesRequest.MountID)
+		return
+	}
+
+	if mount.authTokenHasExpired() {
+		globals.Unlock()
+		err = fmt.Errorf("%s %s", EAuthTokenRejected, mount.authToken)
+		return
+	}
+
+	for _, putInodeTableEntry = range putInodeTableEntriesRequest.UpdatedInodeTableEntryArray {
+		leaseRequest, ok = mount.leaseRequestMap[putInodeTableEntry.InodeNumber]
+		if !ok || !leaseRequest.okToWrite() {
+			globals.Unlock()
+			err = fmt.Errorf("%s %016X", EMissingLease, putInodeTableEntry.InodeNumber)
+			return
+		}
+	}
+
+	volume = mount.volume
+
+	for _, putInodeTableEntry = range putInodeTableEntriesRequest.UpdatedInodeTableEntryArray {
+		inodeTableEntryValue = ilayout.InodeTableEntryValueV1Struct{
+			InodeHeadObjectNumber: putInodeTableEntry.InodeHeadObjectNumber,
+			InodeHeadLength:       putInodeTableEntry.InodeHeadLength,
+		}
+
+		ok, err = volume.inodeTable.PatchByKey(putInodeTableEntry.InodeNumber, inodeTableEntryValue)
+		if nil != err {
+			logFatalf("volume.inodeTable.PatchByKey(putInodeTableEntry.InodeNumber,) failed: %v", err)
+		}
+		if !ok {
+			ok, err = volume.inodeTable.Put(putInodeTableEntry.InodeNumber, inodeTableEntryValue)
+			if nil != err {
+				logFatalf("volume.inodeTable.Put(putInodeTableEntry.InodeNumber,) failed: %v", err)
+			}
+			if !ok {
+				logFatalf("volume.inodeTable.Put(putInodeTableEntry.InodeNumber,) returned !ok")
+			}
+		}
+	}
+
+	volume.superBlock.InodeObjectCount = uint64(int64(volume.superBlock.InodeObjectCount) + putInodeTableEntriesRequest.SuperBlockInodeObjectCountAdjustment)
+	volume.superBlock.InodeObjectSize = uint64(int64(volume.superBlock.InodeObjectSize) + putInodeTableEntriesRequest.SuperBlockInodeObjectSizeAdjustment)
+	volume.superBlock.InodeBytesReferenced = uint64(int64(volume.superBlock.InodeBytesReferenced) + putInodeTableEntriesRequest.SuperBlockInodeBytesReferencedAdjustment)
+
+	for _, dereferencedObjectNumber = range putInodeTableEntriesRequest.DereferencedObjectNumberArray {
+		_ = volume.pendingDeleteObjectNumberList.PushBack(dereferencedObjectNumber)
+	}
+
+	volume.dirty = true
+
+	globals.Unlock()
+
+	err = nil
+	return
 }
 
 func deleteInodeTableEntry(deleteInodeTableEntryRequest *DeleteInodeTableEntryRequestStruct, deleteInodeTableEntryResponse *DeleteInodeTableEntryResponseStruct) (err error) {
 	var (
-		startTime time.Time
+		inodeOpenMapElement *inodeOpenMapElementStruct
+		leaseRequest        *leaseRequestStruct
+		mount               *mountStruct
+		ok                  bool
+		startTime           time.Time = time.Now()
 	)
 
-	startTime = time.Now()
+	logTracef("==> [RPC] DeleteInodeTableEntry(deleteInodeTableEntryRequest: %+v,)", deleteInodeTableEntryRequest)
+	defer func() {
+		if err == nil {
+			logTracef("<== [RPC] DeleteInodeTableEntry(deleteInodeTableEntryRequest: %+v, deleteInodeTableEntryResponse: %+v)", deleteInodeTableEntryRequest, deleteInodeTableEntryResponse)
+		} else {
+			logTracef("<== [RPC] DeleteInodeTableEntry(deleteInodeTableEntryRequest: %+v,) failed: %v", deleteInodeTableEntryRequest, err)
+		}
+	}()
 
 	defer func() {
 		globals.stats.DeleteInodeTableEntryUsecs.Add(uint64(time.Since(startTime) / time.Microsecond))
 	}()
 
-	return fmt.Errorf(ETODO + " deleteInodeTableEntry")
+	globals.Lock()
+
+	mount, ok = globals.mountMap[deleteInodeTableEntryRequest.MountID]
+	if !ok {
+		globals.Unlock()
+		err = fmt.Errorf("%s %s", EUnknownMountID, deleteInodeTableEntryRequest.MountID)
+		return
+	}
+
+	if mount.authTokenHasExpired() {
+		globals.Unlock()
+		err = fmt.Errorf("%s %s", EAuthTokenRejected, mount.authToken)
+		return
+	}
+
+	leaseRequest, ok = mount.leaseRequestMap[deleteInodeTableEntryRequest.InodeNumber]
+	if !ok || !leaseRequest.okToWrite() {
+		globals.Unlock()
+		err = fmt.Errorf("%s %016X", EMissingLease, deleteInodeTableEntryRequest.InodeNumber)
+		return
+	}
+
+	inodeOpenMapElement, ok = mount.volume.inodeOpenMap[deleteInodeTableEntryRequest.InodeNumber]
+	if ok {
+		inodeOpenMapElement.markedForDeletion = true
+	} else {
+		mount.volume.removeInodeWhileLocked(deleteInodeTableEntryRequest.InodeNumber)
+	}
+
+	globals.Unlock()
+
+	err = nil
+	return
 }
 
 func adjustInodeTableEntryOpenCount(adjustInodeTableEntryOpenCountRequest *AdjustInodeTableEntryOpenCountRequestStruct, adjustInodeTableEntryOpenCountResponse *AdjustInodeTableEntryOpenCountResponseStruct) (err error) {
 	var (
-		startTime time.Time
+		inodeOpenCount      uint64
+		inodeOpenMapElement *inodeOpenMapElementStruct
+		leaseRequest        *leaseRequestStruct
+		mount               *mountStruct
+		ok                  bool
+		startTime           time.Time = time.Now()
 	)
 
-	startTime = time.Now()
+	logTracef("==> [RPC] AdjustInodeTableEntryOpenCount(adjustInodeTableEntryOpenCountRequest: %+v,)", adjustInodeTableEntryOpenCountRequest)
+	defer func() {
+		if err == nil {
+			logTracef("<== [RPC] AdjustInodeTableEntryOpenCount(adjustInodeTableEntryOpenCountRequest: %+v, adjustInodeTableEntryOpenCountResponse: %+v)", adjustInodeTableEntryOpenCountRequest, adjustInodeTableEntryOpenCountResponse)
+		} else {
+			logTracef("<== [RPC] AdjustInodeTableEntryOpenCount(adjustInodeTableEntryOpenCountRequest: %+v,) failed: %v", adjustInodeTableEntryOpenCountRequest, err)
+		}
+	}()
 
 	defer func() {
 		globals.stats.AdjustInodeTableEntryOpenCountUsecs.Add(uint64(time.Since(startTime) / time.Microsecond))
 	}()
 
-	return fmt.Errorf(ETODO + " adjustInodeTableEntryOpenCount")
+	if adjustInodeTableEntryOpenCountRequest.Adjustment == 0 {
+		err = fmt.Errorf("%s %016X %v", EBadOpenCountAdjustment, adjustInodeTableEntryOpenCountRequest.InodeNumber, adjustInodeTableEntryOpenCountRequest.Adjustment)
+		return
+	}
+
+	globals.Lock()
+
+	mount, ok = globals.mountMap[adjustInodeTableEntryOpenCountRequest.MountID]
+	if !ok {
+		globals.Unlock()
+		err = fmt.Errorf("%s %s", EUnknownMountID, adjustInodeTableEntryOpenCountRequest.MountID)
+		return
+	}
+
+	if mount.authTokenHasExpired() {
+		globals.Unlock()
+		err = fmt.Errorf("%s %s", EAuthTokenRejected, mount.authToken)
+		return
+	}
+
+	leaseRequest, ok = mount.leaseRequestMap[adjustInodeTableEntryOpenCountRequest.InodeNumber]
+	if !ok || !leaseRequest.okToRead() {
+		globals.Unlock()
+		err = fmt.Errorf("%s %016X", EMissingLease, adjustInodeTableEntryOpenCountRequest.InodeNumber)
+		return
+	}
+
+	inodeOpenCount, ok = mount.inodeOpenMap[adjustInodeTableEntryOpenCountRequest.InodeNumber]
+	if ok {
+		if inodeOpenCount == 0 {
+			logFatalf("mount.inodeOpenMap[adjustInodeTableEntryOpenCountRequest.InodeNumber] returned 0")
+		}
+		if (adjustInodeTableEntryOpenCountRequest.Adjustment < 0) && (uint64(-adjustInodeTableEntryOpenCountRequest.Adjustment) > inodeOpenCount) {
+			globals.Unlock()
+			err = fmt.Errorf("%s %016X %v", EBadOpenCountAdjustment, adjustInodeTableEntryOpenCountRequest.InodeNumber, adjustInodeTableEntryOpenCountRequest.Adjustment)
+			return
+		}
+	} else {
+		if adjustInodeTableEntryOpenCountRequest.Adjustment < 0 {
+			globals.Unlock()
+			err = fmt.Errorf("%s %016X %v", EBadOpenCountAdjustment, adjustInodeTableEntryOpenCountRequest.InodeNumber, adjustInodeTableEntryOpenCountRequest.Adjustment)
+			return
+		}
+		inodeOpenCount = 0
+	}
+
+	inodeOpenMapElement, ok = mount.volume.inodeOpenMap[adjustInodeTableEntryOpenCountRequest.InodeNumber]
+	if ok {
+		if inodeOpenMapElement.numMounts == 0 {
+			logFatalf("mount.volume.inodeOpenMap[adjustInodeTableEntryOpenCountRequest.InodeNumber] returned inodeOpenMapElement.numMounts == 0")
+		}
+	} else {
+		if inodeOpenCount != 0 {
+			logFatalf("inodeOpenCount can't be != 0 if inodeOpenMapElement is missing")
+		}
+		if adjustInodeTableEntryOpenCountRequest.Adjustment < 0 {
+			logFatalf("adjustInodeTableEntryOpenCountRequest.Adjustment can't be < 0 if inodeOpenMapElement is missing")
+		}
+		inodeOpenMapElement = &inodeOpenMapElementStruct{
+			numMounts:         0,
+			markedForDeletion: false,
+		}
+		mount.volume.inodeOpenMap[adjustInodeTableEntryOpenCountRequest.InodeNumber] = inodeOpenMapElement
+	}
+
+	if adjustInodeTableEntryOpenCountRequest.Adjustment > 0 {
+		if inodeOpenCount == 0 {
+			mount.inodeOpenMap[adjustInodeTableEntryOpenCountRequest.InodeNumber] = uint64(adjustInodeTableEntryOpenCountRequest.Adjustment)
+			inodeOpenMapElement.numMounts++
+		} else {
+			mount.inodeOpenMap[adjustInodeTableEntryOpenCountRequest.InodeNumber] = inodeOpenCount + uint64(adjustInodeTableEntryOpenCountRequest.Adjustment)
+		}
+	} else { // adjustInodeTableEntryOpenCountRequest.Adjustment < 0 [we already know it is != 0]
+		inodeOpenCount -= uint64(-adjustInodeTableEntryOpenCountRequest.Adjustment)
+		if inodeOpenCount == 0 {
+			delete(mount.inodeOpenMap, adjustInodeTableEntryOpenCountRequest.InodeNumber)
+			inodeOpenMapElement.numMounts--
+			if inodeOpenMapElement.numMounts == 0 {
+				delete(mount.volume.inodeOpenMap, adjustInodeTableEntryOpenCountRequest.InodeNumber)
+				if inodeOpenMapElement.markedForDeletion {
+					mount.volume.removeInodeWhileLocked(adjustInodeTableEntryOpenCountRequest.InodeNumber)
+				}
+			}
+		} else { // [adjusted] inodeOpenCount > 0
+			mount.inodeOpenMap[adjustInodeTableEntryOpenCountRequest.InodeNumber] = inodeOpenCount
+		}
+	}
+
+	globals.Unlock()
+
+	err = nil
+	return
 }
 
 func flush(flushRequest *FlushRequestStruct, flushResponse *FlushResponseStruct) (err error) {
@@ -292,11 +749,18 @@ func flush(flushRequest *FlushRequestStruct, flushResponse *FlushResponseStruct)
 		checkPointResponseChan chan error
 		mount                  *mountStruct
 		ok                     bool
-		startTime              time.Time
+		startTime              time.Time = time.Now()
 		volume                 *volumeStruct
 	)
 
-	startTime = time.Now()
+	logTracef("==> [RPC] Flush(flushRequest: %+v,)", flushRequest)
+	defer func() {
+		if err == nil {
+			logTracef("<== [RPC] Flush(flushRequest: %+v, flushResponse: %+v)", flushRequest, flushResponse)
+		} else {
+			logTracef("<== [RPC] Flush(flushRequest: %+v,) failed: %v", flushRequest, err)
+		}
+	}()
 
 	defer func() {
 		globals.stats.FlushUsecs.Add(uint64(time.Since(startTime) / time.Microsecond))
@@ -304,29 +768,32 @@ func flush(flushRequest *FlushRequestStruct, flushResponse *FlushResponseStruct)
 
 	checkPointResponseChan = make(chan error)
 
-	globals.RLock()
+	globals.Lock()
 
 	mount, ok = globals.mountMap[flushRequest.MountID]
 	if !ok {
-		globals.RUnlock()
+		globals.Unlock()
 		err = fmt.Errorf("%s %s", EUnknownMountID, flushRequest.MountID)
 		return
 	}
 
 	volume = mount.volume
 
-	volume.RLock()
-	globals.RUnlock()
+	if mount.authTokenHasExpired() {
+		globals.Unlock()
+		err = fmt.Errorf("%s %s", EAuthTokenRejected, mount.authToken)
+		return
+	}
 
 	if nil == volume.checkPointControlChan {
-		volume.RUnlock()
+		globals.Unlock()
 		err = nil
 		return
 	}
 
 	volume.checkPointControlChan <- checkPointResponseChan
 
-	volume.RUnlock()
+	globals.Unlock()
 
 	err = <-checkPointResponseChan
 
@@ -335,10 +802,22 @@ func flush(flushRequest *FlushRequestStruct, flushResponse *FlushResponseStruct)
 
 func lease(leaseRequest *LeaseRequestStruct, leaseResponse *LeaseResponseStruct) (err error) {
 	var (
-		startTime time.Time
+		inodeLease            *inodeLeaseStruct
+		leaseRequestOperation *leaseRequestOperationStruct
+		mount                 *mountStruct
+		ok                    bool
+		startTime             time.Time = time.Now()
+		volume                *volumeStruct
 	)
 
-	startTime = time.Now()
+	logTracef("==> [RPC] Lease(leaseRequest: %+v,)", leaseRequest)
+	defer func() {
+		if err == nil {
+			logTracef("<== [RPC] Lease(leaseRequest: %+v, leaseResponse: %+v)", leaseRequest, leaseResponse)
+		} else {
+			logTracef("<== [RPC] Lease(leaseRequest: %+v,) failed: %v", leaseRequest, err)
+		}
+	}()
 
 	defer func() {
 		globals.stats.LeaseUsecs.Add(uint64(time.Since(startTime) / time.Microsecond))
@@ -367,10 +846,113 @@ func lease(leaseRequest *LeaseRequestStruct, leaseResponse *LeaseResponseStruct)
 		}()
 	default:
 		leaseResponse.LeaseResponseType = LeaseResponseTypeDenied
-		err = fmt.Errorf("LeaseRequestType %v not supported", leaseRequest.LeaseRequestType)
-		err = blunder.AddError(err, blunder.BadLeaseRequest)
+		err = fmt.Errorf("%s LeaseRequestType %v not supported", ELeaseRequestDenied, leaseRequest.LeaseRequestType)
 		return
 	}
 
-	return fmt.Errorf(ETODO + " lease")
+	globals.Lock()
+
+	mount, ok = globals.mountMap[leaseRequest.MountID]
+	if !ok {
+		globals.Unlock()
+		err = fmt.Errorf("%s %s", EUnknownMountID, leaseRequest.MountID)
+		return
+	}
+
+	volume = mount.volume
+
+	if mount.authTokenHasExpired() {
+		globals.Unlock()
+		err = fmt.Errorf("%s %s", EAuthTokenRejected, mount.authToken)
+		return
+	}
+
+	if (leaseRequest.LeaseRequestType == LeaseRequestTypeShared) || (leaseRequest.LeaseRequestType == LeaseRequestTypeExclusive) {
+		if !mount.acceptingLeaseRequests {
+			globals.Unlock()
+			leaseResponse.LeaseResponseType = LeaseResponseTypeDenied
+			err = fmt.Errorf("%s LeaseRequestType %v not currently being accepted", ELeaseRequestDenied, leaseRequest.LeaseRequestType)
+			return
+		}
+		inodeLease, ok = volume.inodeLeaseMap[leaseRequest.InodeNumber]
+		if !ok {
+			inodeLease = &inodeLeaseStruct{
+				volume:               volume,
+				inodeNumber:          leaseRequest.InodeNumber,
+				leaseState:           inodeLeaseStateNone,
+				requestChan:          make(chan *leaseRequestOperationStruct),
+				stopChan:             make(chan struct{}),
+				sharedHoldersList:    list.New(),
+				promotingHolder:      nil,
+				exclusiveHolder:      nil,
+				releasingHoldersList: list.New(),
+				requestedList:        list.New(),
+				lastGrantTime:        time.Time{},
+				lastInterruptTime:    time.Time{},
+				interruptsSent:       0,
+				longAgoTimer:         &time.Timer{},
+				interruptTimer:       &time.Timer{},
+			}
+
+			volume.inodeLeaseMap[leaseRequest.InodeNumber] = inodeLease
+			inodeLease.lruElement = globals.inodeLeaseLRU.PushBack(inodeLease)
+
+			volume.leaseHandlerWG.Add(1)
+			go inodeLease.handler()
+		}
+	} else { // in.LeaseRequestType is one of LeaseRequestType{Promote|Demote|Release}
+		inodeLease, ok = volume.inodeLeaseMap[leaseRequest.InodeNumber]
+		if !ok {
+			globals.Unlock()
+			leaseResponse.LeaseResponseType = LeaseResponseTypeDenied
+			err = fmt.Errorf("%s LeaseRequestType %v not allowed for non-existent Lease", ELeaseRequestDenied, leaseRequest.LeaseRequestType)
+			return
+		}
+	}
+
+	// Send Lease Request Operation to *inodeLeaseStruct.handler()
+	//
+	// Note that we still hold the globals.Lock, so inodeLease can't disappear out from under us
+
+	leaseRequestOperation = &leaseRequestOperationStruct{
+		mount:            mount,
+		inodeLease:       inodeLease,
+		LeaseRequestType: leaseRequest.LeaseRequestType,
+		replyChan:        make(chan LeaseResponseType),
+	}
+
+	inodeLease.requestChan <- leaseRequestOperation
+
+	globals.Unlock()
+
+	leaseResponse.LeaseResponseType = <-leaseRequestOperation.replyChan
+
+	return
+}
+
+func (mount *mountStruct) authTokenHasExpired() (authTokenExpired bool) {
+	var (
+		authTokenIsAuthorized bool
+		startTime             time.Time = time.Now()
+	)
+
+	if mount.authTokenExpired {
+		return true
+	}
+
+	if startTime.Sub(mount.lastAuthTime) < globals.config.AuthTokenCheckInterval {
+		return false
+	}
+
+	authTokenIsAuthorized = checkAuthToken(mount.volume.storageURL, mount.authToken)
+
+	globals.stats.AuthTokenCheckUsecs.Add(uint64(time.Since(startTime) / time.Microsecond))
+
+	// if nil == err {
+	if authTokenIsAuthorized {
+		mount.lastAuthTime = startTime
+		return false
+	} else {
+		return true
+	}
 }
