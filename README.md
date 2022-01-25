@@ -2,12 +2,13 @@
 [![Coverage Status](https://coveralls.io/repos/github/swiftstack/ProxyFS/badge.svg?branch=development)](https://coveralls.io/github/swiftstack/ProxyFS?branch=development)
 
 # ProxyFS
-Integrated File and Object Access for Swift Object Storage
+Provides a POSIX compliant file system mount of an OpenStack Swift Object Storage Container
 
 ## Synopsis
 
 ProxyFS is a disributed read/write hierarchical POSIX file system layered on top of 
-[Swift object storage](http://swift.openstack.org).
+[Swift object storage](http://swift.openstack.org). File system accesses map to Objects
+inside a Swift Container.
 
 ## How to Contribute
 
@@ -32,12 +33,55 @@ or the [ProxyFS Slack group](https://proxyfs.slack.com), which you can join thro
 * git clone git@github.com:NVIDIA/proxyfs.git
 * cd proxyfs
 
-## How to run unit tests (in your Development Environment)
+## Docker-based Development Environment
 
-* [Host shell] docker compose build
-* [Host shell] docker compose up -d dev
-* [dev  shell] make
-* [dev  shell] make test
+ProxyFS develoment/building leverages Docker Containers and Docker Compose.
+
+A Multi-Stage `Dockerfile` is provided that builds the following three images:
+
+* `dev` - used to build, debug, and unit test a simple ProxyFS deployment
+* `build` - used to provide a clean build environment for constructing `deploy`
+* `deploy` - a space/dependency efficient deployable Docker Container holding:
+  * `ickpt` - an optional, replicable, strictly consistent service to store ProxyFS checkpoints that are, otherwise, the only element of a ProxyFS file system subject to the Eventual Consistency risk of using OpenStack Swift as a storage back-end
+  * `imgr` - a service capable of managing the metadata for a collection of ProxyFS file systems
+  * `iclient` - the FUSE service deployed to support the mounting of a ProxyFS file system
+
+To build the images:
+
+* docker-compose build
+
+To instantiate either a development or test environment, a `docker-compose.yml` is provided that instantiates the following Docker Containers:
+
+* `swift` - a deployment of a Swift "All-in-One" Container instance
+* `dev` - an instance of the `dev` image with your ProxyFS repo dir mapped to `/src`
+* `ickpt` - an instance of the `deploy` image that launches the `ickpt` service
+* `imgr` - an instance of the `deploy` image that launches the `imgr` service
+* `iclient` - an instance of the `deploy` image that launches the `iclient` service setup to present its FUSE mount point at `/mnt`
+
+To kick off development activities:
+
+* [Host shell] docker-compose up -d dev
+* [Host shell] docker-compose exec dev sh
+* [`dev` /src#] make
+* [`dev` /src#] rm -rf /tmp/ickptDB
+* [`dev` /src#] ickpt/ickpt ickpt/dev.conf &
+* [`dev` /src#] imgr/imgr imgr/dev.conf &
+* [`dev` /src#] imgr/mkmount.sh -fs
+* [`dev` /src#] iclient/iclient iclient/dev.conf &
+
+Note that `imgr` and `iclient` will be logging to $StdOut in this example launching. Each of the above can be terminated by delivering a SIGINT or SIGTERM to their processes.
+
+For a more appropriate environment in which to perform functional testing, the `docker-compose.yml` file my also be used to launch the suite of Docker Containers:
+
+* [Host shell] docker-compose up -d iclient
+* [Host shell] docker-compose exec iclient sh
+
+At this point, you have a separate Docker Container running each of the ProxyFS services. Inside the `iclient` Docker Container, the `/mnt` directory will be the FUSE mount point to your ProxyFS file system.
+
+Both the `imgr` and `iclient` services provide an HTTP endpoint that, due to the port mapping specified in `docker-compose.yml`, should be reachable from a browser in the host:
+
+* `imgr` - http://localhost:15346/
+* `iclient` - http://localhost:15347/
 
 ## License
 
