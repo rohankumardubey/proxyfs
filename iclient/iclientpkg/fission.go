@@ -335,37 +335,42 @@ Retry:
 		}
 	}
 
-	inode.dirty = true
-
-	inode.inodeHeadV1.StatusChangeTime = startTime
-
 	if (setAttrIn.Valid & fission.SetAttrInValidMode) != 0 {
+		inode.dirty = true
 		inode.inodeHeadV1.Mode = uint16(setAttrIn.Mode & uint32(syscall.S_IRWXU|syscall.S_IRWXG|syscall.S_IRWXO))
 	}
 
 	if (setAttrIn.Valid & fission.SetAttrInValidUID) != 0 {
+		inode.dirty = true
 		inode.inodeHeadV1.UserID = uint64(setAttrIn.UID)
 	}
 
 	if (setAttrIn.Valid & fission.SetAttrInValidGID) != 0 {
+		inode.dirty = true
 		inode.inodeHeadV1.GroupID = uint64(setAttrIn.GID)
 	}
 
 	if (setAttrIn.Valid & fission.SetAttrInValidSize) != 0 {
-		if setAttrIn.Size < inode.inodeHeadV1.Size {
-			if inode.payload == nil {
-				err = inode.oldPayload()
-				if nil != err {
-					logFatalf("inode.oldPayload() failed: %v", err)
-				}
-			}
+		if setAttrIn.Size != inode.inodeHeadV1.Size {
+			inode.dirty = true
+			inode.inodeHeadV1.ModificationTime = startTime
 
-			inode.unmapExtent(setAttrIn.Size, 0)
+			if setAttrIn.Size < inode.inodeHeadV1.Size {
+				if inode.payload == nil {
+					err = inode.oldPayload()
+					if nil != err {
+						logFatalf("inode.oldPayload() failed: %v", err)
+					}
+				}
+
+				inode.unmapExtent(setAttrIn.Size, 0)
+			}
+			inode.inodeHeadV1.Size = setAttrIn.Size
 		}
-		inode.inodeHeadV1.Size = setAttrIn.Size
 	}
 
 	if (setAttrIn.Valid & fission.SetAttrInValidMTime) != 0 {
+		inode.dirty = true
 		if (setAttrIn.Valid & fission.SetAttrInValidMTimeNow) != 0 {
 			inode.inodeHeadV1.ModificationTime = startTime
 		} else {
@@ -373,9 +378,12 @@ Retry:
 		}
 	}
 
-	inodeNumber = inode.inodeNumber
+	if inode.dirty {
+		inode.inodeHeadV1.StatusChangeTime = startTime
+		flushInodesInSlice([]*inodeStruct{inode})
+	}
 
-	flushInodesInSlice([]*inodeStruct{inode})
+	inodeNumber = inode.inodeNumber
 
 	inodeLockRequest.unlockAll()
 
