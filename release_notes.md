@@ -1,5 +1,11 @@
 # ProxyFS Release Notes
 
+## 2.01.0 (March 16, 2022)
+
+### Notes:
+
+This release marks the milestone of removing all previously skipped Unit Test cases and the passing of the full set. The focus of development on ProxyFS now moves into Functional Test completeness and Hardening areas. Performance tuning/optimization will follow those efforts.
+
 ## 2.00.0 (January 25, 2022)
 
 ### Notes:

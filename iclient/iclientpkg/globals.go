@@ -66,6 +66,7 @@ type configStruct struct {
 	LogToConsole                     bool
 	TraceEnabled                     bool
 	FUSELogEnabled                   bool
+	RetryRPCLogEnabled               bool
 	HTTPServerIPAddr                 string
 	HTTPServerPort                   uint16 // To be served on HTTPServerIPAddr via TCP
 }
@@ -92,7 +93,7 @@ const (
 )
 
 type layoutMapEntryStruct struct {
-	objectSize      uint64
+	bytesWritten    uint64
 	bytesReferenced uint64
 }
 
@@ -114,8 +115,6 @@ type fileInodeFlusherStruct struct {
 type inodeStruct struct {
 	inodeNumber     uint64                                         //
 	dirty           bool                                           //
-	openCount       uint64                                         //
-	markedForDelete bool                                           // If true, remove from globalsStruct.inodeTable once openCount == 0
 	leaseState      inodeLeaseStateType                            //
 	listElement     *list.Element                                  // Maintains position in globalsStruct.{shared|exclusive}LeaseLRU
 	lockHolder      *inodeHeldLockStruct                           // If == nil, not locked
@@ -127,7 +126,7 @@ type inodeStruct struct {
 	payload         sortedmap.BPlusTree                            // For DirInode:  Directory B+Tree from .inodeHeadV1.PayloadObjec{Number|Offset|Length}
 	//                                                                For FileInode: ExtentMap B+Tree from .inodeHeadV1.PayloadObjec{Number|Offset|Length}
 	superBlockInodeObjectCountAdjustment     int64    //
-	superBlockInodeObjectSizeAdjustment      int64    //
+	superBlockInodeBytesWrittenAdjustment    int64    //
 	superBlockInodeBytesReferencedAdjustment int64    //
 	dereferencedObjectNumberArray            []uint64 //
 	putObjectNumber                          uint64   //              ObjectNumber to PUT during flush
@@ -499,6 +498,10 @@ func initializeGlobals(confMap conf.ConfMap, fissionErrChan chan error) (err err
 	if nil != err {
 		logFatal(err)
 	}
+	globals.config.RetryRPCLogEnabled, err = confMap.FetchOptionValueBool("ICLIENT", "RetryRPCLogEnabled")
+	if nil != err {
+		logFatal(err)
+	}
 	globals.config.HTTPServerIPAddr, err = confMap.FetchOptionValueString("ICLIENT", "HTTPServerIPAddr")
 	if nil != err {
 		globals.config.HTTPServerIPAddr = "0.0.0.0"
@@ -589,6 +592,7 @@ func uninitializeGlobals() (err error) {
 	globals.config.LogToConsole = false
 	globals.config.TraceEnabled = false
 	globals.config.FUSELogEnabled = false
+	globals.config.RetryRPCLogEnabled = false
 	globals.config.HTTPServerIPAddr = ""
 	globals.config.HTTPServerPort = 0
 

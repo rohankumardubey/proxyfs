@@ -5,6 +5,7 @@ package imgrpkg
 
 import (
 	"bytes"
+	"container/list"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -27,7 +28,7 @@ const (
 )
 
 type testInodeHeadLayoutEntryV1Struct struct {
-	objectSize      uint64
+	bytesWritten    uint64
 	bytesReferenced uint64
 }
 
@@ -35,7 +36,7 @@ type testFileInodeStruct struct {
 	inodeHeadV1                              *ilayout.InodeHeadV1Struct
 	layoutAsMap                              map[uint64]*testInodeHeadLayoutEntryV1Struct // key == ilayout.InodeHeadLayoutEntryV1Struct; value == remaining fields of ilayout.InodeHeadLayoutEntryV1Struct
 	superBlockInodeObjectCountAdjustment     int64                                        // to be sent in next PutInodeTableEntriesRequest
-	superBlockInodeObjectSizeAdjustment      int64                                        // to be sent in next PutInodeTableEntriesRequest
+	superBlockInodeBytesWrittenAdjustment    int64                                        // to be sent in next PutInodeTableEntriesRequest
 	superBlockInodeBytesReferencedAdjustment int64                                        // to be sent in next PutInodeTableEntriesRequest
 	dereferencedObjectNumberArray            []uint64                                     // to be sent in next PutInodeTableEntriesRequest
 	extentMapCache                           sortedmap.BPlusTreeCache
@@ -69,7 +70,7 @@ func newTestFileInode(inodeNumber uint64) (testFileInode *testFileInodeStruct) {
 		},
 		layoutAsMap:                              make(map[uint64]*testInodeHeadLayoutEntryV1Struct),
 		superBlockInodeObjectCountAdjustment:     0,
-		superBlockInodeObjectSizeAdjustment:      0,
+		superBlockInodeBytesWrittenAdjustment:    0,
 		superBlockInodeBytesReferencedAdjustment: 0,
 		dereferencedObjectNumberArray:            []uint64{},
 		extentMapCache:                           sortedmap.NewBPlusTreeCache(testFileInodeExtentMapCacheEvictLowLimit, testFileInodeExtentMapCacheEvictHighLimit),
@@ -97,7 +98,7 @@ func oldTestFileInode(inodeHeadV1 *ilayout.InodeHeadV1Struct) (testFileInode *te
 		inodeHeadV1:                              inodeHeadV1,
 		layoutAsMap:                              make(map[uint64]*testInodeHeadLayoutEntryV1Struct),
 		superBlockInodeObjectCountAdjustment:     0,
-		superBlockInodeObjectSizeAdjustment:      0,
+		superBlockInodeBytesWrittenAdjustment:    0,
 		superBlockInodeBytesReferencedAdjustment: 0,
 		dereferencedObjectNumberArray:            []uint64{},
 		extentMapCache:                           sortedmap.NewBPlusTreeCache(testFileInodeExtentMapCacheEvictLowLimit, testFileInodeExtentMapCacheEvictHighLimit),
@@ -108,7 +109,7 @@ func oldTestFileInode(inodeHeadV1 *ilayout.InodeHeadV1Struct) (testFileInode *te
 
 	for _, inodeHeadLayoutEntryV1 = range testFileInode.inodeHeadV1.Layout {
 		testFileInode.layoutAsMap[inodeHeadLayoutEntryV1.ObjectNumber] = &testInodeHeadLayoutEntryV1Struct{
-			objectSize:      inodeHeadLayoutEntryV1.ObjectSize,
+			bytesWritten:    inodeHeadLayoutEntryV1.BytesWritten,
 			bytesReferenced: inodeHeadLayoutEntryV1.BytesReferenced,
 		}
 	}
@@ -168,7 +169,7 @@ func (testFileInode *testFileInodeStruct) externalizeInodeHeadV1Layout() {
 	for layoutIndex, objectNumber = range inodeHeadLayoutEntryV1StructObjectNumberSlice {
 		testFileInode.inodeHeadV1.Layout[layoutIndex] = ilayout.InodeHeadLayoutEntryV1Struct{
 			ObjectNumber:    objectNumber,
-			ObjectSize:      testFileInode.layoutAsMap[objectNumber].objectSize,
+			BytesWritten:    testFileInode.layoutAsMap[objectNumber].bytesWritten,
 			BytesReferenced: testFileInode.layoutAsMap[objectNumber].bytesReferenced,
 		}
 	}
@@ -181,7 +182,7 @@ func (testFileInode *testFileInodeStruct) openObject(objectNumber uint64) (err e
 	}
 
 	testFileInode.superBlockInodeObjectCountAdjustment = 0
-	testFileInode.superBlockInodeObjectSizeAdjustment = 0
+	testFileInode.superBlockInodeBytesWrittenAdjustment = 0
 	testFileInode.superBlockInodeBytesReferencedAdjustment = 0
 	testFileInode.dereferencedObjectNumberArray = []uint64{}
 
@@ -206,9 +207,9 @@ func (testFileInode *testFileInodeStruct) closeObject() (err error) {
 
 	putRequestHeaders["X-Auth-Token"] = []string{testGlobals.authToken}
 
-	_, _, err = testDoHTTPRequest("PUT", testGlobals.containerURL+"/"+ilayout.GetObjectNameAsString(testFileInode.putObjectNumber), putRequestHeaders, testFileInode.putObjectBuffer)
+	_, _, err = testDoHTTPRequest("PUT", testGlobals.containerURL+"/"+ilayout.GetObjectNameAsString(testFileInode.putObjectNumber), putRequestHeaders, testFileInode.putObjectBuffer, http.StatusCreated)
 	if nil != err {
-		err = fmt.Errorf("testDoHTTPRequest(\"PUT\", testGlobals.containerURL+\"/\"+ilayout.GetObjectNameAsString(testFileInode.putObjectNumber), putRequestHeaders, &testFileInode.putObjectBuffer) failed: %v", err)
+		err = fmt.Errorf("testDoHTTPRequest(\"PUT\", testGlobals.containerURL+\"/\"+ilayout.GetObjectNameAsString(testFileInode.putObjectNumber), putRequestHeaders, &testFileInode.putObjectBuffer, http.StatusCreated) failed: %v", err)
 		return
 	}
 
@@ -241,9 +242,9 @@ func (testFileInode *testFileInodeStruct) getObjectData(objectNumber uint64, obj
 		getRequestHeaders["X-Auth-Token"] = []string{testGlobals.authToken}
 		getRequestHeaders["Range"] = []string{fmt.Sprintf("bytes=%d-%d", objectOffset, (objectOffset + objectLength - 1))}
 
-		_, objectData, err = testDoHTTPRequest("GET", testGlobals.containerURL+"/"+ilayout.GetObjectNameAsString(objectNumber), getRequestHeaders, nil)
+		_, objectData, err = testDoHTTPRequest("GET", testGlobals.containerURL+"/"+ilayout.GetObjectNameAsString(objectNumber), getRequestHeaders, nil, http.StatusOK)
 		if nil != err {
-			err = fmt.Errorf("testDoHTTPRequest(\"GET\", testGlobals.containerURL+\"/\"+ilayout.GetObjectNameAsString(objectNumber: %v, Range: %v), getRequestHeaders, nil) failed: %v", objectNumber, getRequestHeaders["Range"][0], err)
+			err = fmt.Errorf("testDoHTTPRequest(\"GET\", testGlobals.containerURL+\"/\"+ilayout.GetObjectNameAsString(objectNumber: %v, Range: %v), getRequestHeaders, nil, http.StatusOK) failed: %v", objectNumber, getRequestHeaders["Range"][0], err)
 			return
 		}
 	}
@@ -275,18 +276,18 @@ func (testFileInode *testFileInodeStruct) putObjectData(objectData []byte, track
 	if trackedInLayout {
 		testInodeHeadLayoutEntryV1, ok = testFileInode.layoutAsMap[testFileInode.putObjectNumber]
 		if ok {
-			testInodeHeadLayoutEntryV1.objectSize += uint64(len(objectData))
+			testInodeHeadLayoutEntryV1.bytesWritten += uint64(len(objectData))
 			testInodeHeadLayoutEntryV1.bytesReferenced += uint64(len(objectData))
 		} else {
 			testInodeHeadLayoutEntryV1 = &testInodeHeadLayoutEntryV1Struct{
-				objectSize:      uint64(len(objectData)),
+				bytesWritten:    uint64(len(objectData)),
 				bytesReferenced: uint64(len(objectData)),
 			}
 
 			testFileInode.layoutAsMap[testFileInode.putObjectNumber] = testInodeHeadLayoutEntryV1
 		}
 
-		testFileInode.superBlockInodeObjectSizeAdjustment += int64(len(objectData))
+		testFileInode.superBlockInodeBytesWrittenAdjustment += int64(len(objectData))
 		testFileInode.superBlockInodeBytesReferencedAdjustment += int64(len(objectData))
 	}
 
@@ -322,7 +323,7 @@ func (testFileInode *testFileInodeStruct) discardObjectData(objectNumber uint64,
 	if testInodeHeadLayoutEntryV1.bytesReferenced == 0 {
 		delete(testFileInode.layoutAsMap, objectNumber)
 		testFileInode.superBlockInodeObjectCountAdjustment--
-		testFileInode.superBlockInodeObjectSizeAdjustment -= int64(testInodeHeadLayoutEntryV1.objectSize)
+		testFileInode.superBlockInodeBytesWrittenAdjustment -= int64(testInodeHeadLayoutEntryV1.bytesWritten)
 		testFileInode.dereferencedObjectNumberArray = append(testFileInode.dereferencedObjectNumberArray, objectNumber)
 	} else {
 		testFileInode.layoutAsMap[objectNumber] = testInodeHeadLayoutEntryV1
@@ -484,6 +485,7 @@ func TestRetryRPC(t *testing.T) {
 	var (
 		adjustInodeTableEntryOpenCountRequest  *AdjustInodeTableEntryOpenCountRequestStruct
 		adjustInodeTableEntryOpenCountResponse *AdjustInodeTableEntryOpenCountResponseStruct
+		currentInodeNumberSet                  map[uint64]struct{}
 		deleteInodeTableEntryRequest           *DeleteInodeTableEntryRequestStruct
 		deleteInodeTableEntryResponse          *DeleteInodeTableEntryResponseStruct
 		err                                    error
@@ -513,6 +515,8 @@ func TestRetryRPC(t *testing.T) {
 		renewMountResponse                     *RenewMountResponseStruct
 		retryrpcClient                         *retryrpc.Client
 		retryrpcClientCallbacks                *testRetryRPCClientCallbacksStruct
+		rpcInterrupt                           *RPCInterrupt
+		rpcInterruptPayload                    []byte
 		testFileInode                          *testFileInodeStruct
 		unmountRequest                         *UnmountRequestStruct
 		unmountResponse                        *UnmountResponseStruct
@@ -521,12 +525,12 @@ func TestRetryRPC(t *testing.T) {
 	// Setup RetryRPC Client
 
 	retryrpcClientCallbacks = &testRetryRPCClientCallbacksStruct{
-		interruptPayloadChan: make(chan []byte),
+		interruptPayloadChan: make(chan []byte, 1),
 	}
 
 	// Setup test environment
 
-	testSetup(t, retryrpcClientCallbacks)
+	testSetup(t, nil, retryrpcClientCallbacks)
 
 	retryrpcClient, err = retryrpc.NewClient(testGlobals.retryrpcClientConfig)
 	if nil != err {
@@ -537,18 +541,18 @@ func TestRetryRPC(t *testing.T) {
 
 	postRequestBody = fmt.Sprintf("{\"StorageURL\":\"%s\",\"AuthToken\":\"%s\"}", testGlobals.containerURL, testGlobals.authToken)
 
-	_, _, err = testDoHTTPRequest("POST", testGlobals.httpServerURL+"/volume", nil, strings.NewReader(postRequestBody))
+	_, _, err = testDoHTTPRequest("POST", testGlobals.httpServerURL+"/volume", nil, strings.NewReader(postRequestBody), http.StatusCreated)
 	if nil != err {
-		t.Fatalf("testDoHTTPRequest(\"POST\", testGlobals.httpServerURL+\"/volume\", nil, strings.NewReader(postRequestBody)) failed: %v", err)
+		t.Fatalf("testDoHTTPRequest(\"POST\", testGlobals.httpServerURL+\"/volume\", nil, strings.NewReader(postRequestBody), http.StatusCreated) failed: %v", err)
 	}
 
 	// Start serving testVolume
 
 	putRequestBody = fmt.Sprintf("{\"StorageURL\":\"%s\"}", testGlobals.containerURL)
 
-	_, _, err = testDoHTTPRequest("PUT", testGlobals.httpServerURL+"/volume/"+testVolume, nil, strings.NewReader(putRequestBody))
+	_, _, err = testDoHTTPRequest("PUT", testGlobals.httpServerURL+"/volume/"+testVolume, nil, strings.NewReader(putRequestBody), http.StatusCreated)
 	if nil != err {
-		t.Fatalf("testDoHTTPRequest(\"PUT\", testGlobals.httpServerURL+\"/volume\"+testVolume, nil, strings.NewReader(putRequestBody)) failed: %v", err)
+		t.Fatalf("testDoHTTPRequest(\"PUT\", testGlobals.httpServerURL+\"/volume\"+testVolume, nil, strings.NewReader(putRequestBody), http.StatusCreated) failed: %v", err)
 	}
 
 	// Attempt a FetchNonceRange() without a prior Mount()... which should fail (no Mount)
@@ -636,6 +640,14 @@ func TestRetryRPC(t *testing.T) {
 		t.Fatalf("retryrpcClient.Send(\"RenewMount(,)\",,) failed: %v", err)
 	}
 
+	// Verify that no Leases are currently held
+
+	currentInodeNumberSet = fetchCurrentInodeNumberInInodeLeaseMapSet(t, mountResponse.MountID)
+
+	if len(currentInodeNumberSet) > 0 {
+		t.Fatalf("currentInodeNumberSet should have been empty")
+	}
+
 	// Fetch a Shared Lease on RootDirInode
 
 	leaseRequest = &LeaseRequestStruct{
@@ -648,6 +660,18 @@ func TestRetryRPC(t *testing.T) {
 	err = retryrpcClient.Send("Lease", leaseRequest, leaseResponse)
 	if nil != err {
 		t.Fatalf("retryrpcClient.Send(\"Lease(,ilayout.RootDirInodeNumber,LeaseRequestTypeShared)\",,) failed: %v", err)
+	}
+
+	// Verify that a Lease was granted on RootDirInode
+
+	currentInodeNumberSet = fetchCurrentInodeNumberInInodeLeaseMapSet(t, mountResponse.MountID)
+
+	if len(currentInodeNumberSet) != 1 {
+		t.Fatalf("currentInodeNumberSet should have had one element")
+	}
+	_, ok = currentInodeNumberSet[ilayout.RootDirInodeNumber]
+	if !ok {
+		t.Fatalf("ilayout.RootDirInodeNumber should have been present")
 	}
 
 	// Perform a GetInodeTableEntry() for RootDirInode
@@ -708,7 +732,7 @@ func TestRetryRPC(t *testing.T) {
 			},
 		},
 		SuperBlockInodeObjectCountAdjustment:     0,
-		SuperBlockInodeObjectSizeAdjustment:      0,
+		SuperBlockInodeBytesWrittenAdjustment:    0,
 		SuperBlockInodeBytesReferencedAdjustment: 0,
 		DereferencedObjectNumberArray:            []uint64{},
 	}
@@ -786,8 +810,8 @@ func TestRetryRPC(t *testing.T) {
 	if testFileInode.inodeHeadV1.Layout[0].ObjectNumber != fileInodeObjectA {
 		t.Fatalf("following testFileInode.externalizeInodeHeadV1Layout(), testFileInode.inodeHeadV1.Layout[0].ObjectNumber was unexpected: %v", testFileInode.inodeHeadV1.Layout[0].ObjectNumber)
 	}
-	if testFileInode.inodeHeadV1.Layout[0].ObjectSize != 3+58 {
-		t.Fatalf("following testFileInode.externalizeInodeHeadV1Layout(), testFileInode.inodeHeadV1.Layout[0].ObjectSize was unexpected: %v", testFileInode.inodeHeadV1.Layout[0].ObjectSize)
+	if testFileInode.inodeHeadV1.Layout[0].BytesWritten != 3+58 {
+		t.Fatalf("following testFileInode.externalizeInodeHeadV1Layout(), testFileInode.inodeHeadV1.Layout[0].BytesWritten was unexpected: %v", testFileInode.inodeHeadV1.Layout[0].BytesWritten)
 	}
 	if testFileInode.inodeHeadV1.Layout[0].BytesReferenced != 3+58 {
 		t.Fatalf("following testFileInode.externalizeInodeHeadV1Layout(), testFileInode.inodeHeadV1.Layout[0].BytesReferenced was unexpected: %v", testFileInode.inodeHeadV1.Layout[0].BytesReferenced)
@@ -828,6 +852,22 @@ func TestRetryRPC(t *testing.T) {
 		t.Fatalf("retryrpcClient.Send(\"Lease(,fileInodeNumber,LeaseRequestTypeExclusive)\",,) failed: %v", err)
 	}
 
+	// Verify that a Lease was granted on FileInode
+
+	currentInodeNumberSet = fetchCurrentInodeNumberInInodeLeaseMapSet(t, mountResponse.MountID)
+
+	if len(currentInodeNumberSet) != 2 {
+		t.Fatalf("currentInodeNumberSet should have had two elements")
+	}
+	_, ok = currentInodeNumberSet[ilayout.RootDirInodeNumber]
+	if !ok {
+		t.Fatalf("ilayout.RootDirInodeNumber should have been present")
+	}
+	_, ok = currentInodeNumberSet[fileInodeNumber]
+	if !ok {
+		t.Fatalf("fileInodeNumber should have been present")
+	}
+
 	// Perform a PutInodeTableEntries() for FileInode
 
 	putInodeTableEntriesRequest = &PutInodeTableEntriesRequestStruct{
@@ -840,7 +880,7 @@ func TestRetryRPC(t *testing.T) {
 			},
 		},
 		SuperBlockInodeObjectCountAdjustment:     testFileInode.superBlockInodeObjectCountAdjustment,
-		SuperBlockInodeObjectSizeAdjustment:      testFileInode.superBlockInodeObjectSizeAdjustment,
+		SuperBlockInodeBytesWrittenAdjustment:    testFileInode.superBlockInodeBytesWrittenAdjustment,
 		SuperBlockInodeBytesReferencedAdjustment: testFileInode.superBlockInodeBytesReferencedAdjustment,
 		DereferencedObjectNumberArray:            testFileInode.dereferencedObjectNumberArray,
 	}
@@ -915,8 +955,8 @@ func TestRetryRPC(t *testing.T) {
 	if testFileInode.inodeHeadV1.Layout[0].ObjectNumber != fileInodeObjectA {
 		t.Fatalf("following testFileInode.externalizeInodeHeadV1Layout(), testFileInode.inodeHeadV1.Layout[0].ObjectNumber was unexpected: %v", testFileInode.inodeHeadV1.Layout[0].ObjectNumber)
 	}
-	if testFileInode.inodeHeadV1.Layout[0].ObjectSize != 3+58 {
-		t.Fatalf("following testFileInode.externalizeInodeHeadV1Layout(), testFileInode.inodeHeadV1.Layout[0].ObjectSize was unexpected: %v", testFileInode.inodeHeadV1.Layout[0].ObjectSize)
+	if testFileInode.inodeHeadV1.Layout[0].BytesWritten != 3+58 {
+		t.Fatalf("following testFileInode.externalizeInodeHeadV1Layout(), testFileInode.inodeHeadV1.Layout[0].BytesWritten was unexpected: %v", testFileInode.inodeHeadV1.Layout[0].BytesWritten)
 	}
 	if testFileInode.inodeHeadV1.Layout[0].BytesReferenced != 3 {
 		t.Fatalf("following testFileInode.externalizeInodeHeadV1Layout(), testFileInode.inodeHeadV1.Layout[0].BytesReferenced was unexpected: %v", testFileInode.inodeHeadV1.Layout[0].BytesReferenced)
@@ -924,8 +964,8 @@ func TestRetryRPC(t *testing.T) {
 	if testFileInode.inodeHeadV1.Layout[1].ObjectNumber != fileInodeObjectB {
 		t.Fatalf("following testFileInode.externalizeInodeHeadV1Layout(), testFileInode.inodeHeadV1.Layout[1].ObjectNumber was unexpected: %v", testFileInode.inodeHeadV1.Layout[1].ObjectNumber)
 	}
-	if testFileInode.inodeHeadV1.Layout[1].ObjectSize != 4+90 {
-		t.Fatalf("following testFileInode.externalizeInodeHeadV1Layout(), testFileInode.inodeHeadV1.Layout[1].ObjectSize was unexpected: %v", testFileInode.inodeHeadV1.Layout[1].ObjectSize)
+	if testFileInode.inodeHeadV1.Layout[1].BytesWritten != 4+90 {
+		t.Fatalf("following testFileInode.externalizeInodeHeadV1Layout(), testFileInode.inodeHeadV1.Layout[1].BytesWritten was unexpected: %v", testFileInode.inodeHeadV1.Layout[1].BytesWritten)
 	}
 	if testFileInode.inodeHeadV1.Layout[1].BytesReferenced != 4+90 {
 		t.Fatalf("following testFileInode.externalizeInodeHeadV1Layout(), testFileInode.inodeHeadV1.Layout[1].BytesReferenced was unexpected: %v", testFileInode.inodeHeadV1.Layout[1].BytesReferenced)
@@ -964,7 +1004,7 @@ func TestRetryRPC(t *testing.T) {
 			},
 		},
 		SuperBlockInodeObjectCountAdjustment:     testFileInode.superBlockInodeObjectCountAdjustment,
-		SuperBlockInodeObjectSizeAdjustment:      testFileInode.superBlockInodeObjectSizeAdjustment,
+		SuperBlockInodeBytesWrittenAdjustment:    testFileInode.superBlockInodeBytesWrittenAdjustment,
 		SuperBlockInodeBytesReferencedAdjustment: testFileInode.superBlockInodeBytesReferencedAdjustment,
 		DereferencedObjectNumberArray:            testFileInode.dereferencedObjectNumberArray,
 	}
@@ -1065,8 +1105,8 @@ func TestRetryRPC(t *testing.T) {
 	if testFileInode.inodeHeadV1.Layout[0].ObjectNumber != fileInodeObjectB {
 		t.Fatalf("following testFileInode.externalizeInodeHeadV1Layout(), testFileInode.inodeHeadV1.Layout[0].ObjectNumber was unexpected: %v", testFileInode.inodeHeadV1.Layout[0].ObjectNumber)
 	}
-	if testFileInode.inodeHeadV1.Layout[0].ObjectSize != 4+90 {
-		t.Fatalf("following testFileInode.externalizeInodeHeadV1Layout(), testFileInode.inodeHeadV1.Layout[0].ObjectSize was unexpected: %v", testFileInode.inodeHeadV1.Layout[0].ObjectSize)
+	if testFileInode.inodeHeadV1.Layout[0].BytesWritten != 4+90 {
+		t.Fatalf("following testFileInode.externalizeInodeHeadV1Layout(), testFileInode.inodeHeadV1.Layout[0].BytesWritten was unexpected: %v", testFileInode.inodeHeadV1.Layout[0].BytesWritten)
 	}
 	if testFileInode.inodeHeadV1.Layout[0].BytesReferenced != 4 {
 		t.Fatalf("following testFileInode.externalizeInodeHeadV1Layout(), testFileInode.inodeHeadV1.Layout[0].BytesReferenced was unexpected: %v", testFileInode.inodeHeadV1.Layout[0].BytesReferenced)
@@ -1074,8 +1114,8 @@ func TestRetryRPC(t *testing.T) {
 	if testFileInode.inodeHeadV1.Layout[1].ObjectNumber != fileInodeObjectC {
 		t.Fatalf("following testFileInode.externalizeInodeHeadV1Layout(), testFileInode.inodeHeadV1.Layout[1].ObjectNumber was unexpected: %v", testFileInode.inodeHeadV1.Layout[1].ObjectNumber)
 	}
-	if testFileInode.inodeHeadV1.Layout[1].ObjectSize != 3+90 {
-		t.Fatalf("following testFileInode.externalizeInodeHeadV1Layout(), testFileInode.inodeHeadV1.Layout[1].ObjectSize was unexpected: %v", testFileInode.inodeHeadV1.Layout[1].ObjectSize)
+	if testFileInode.inodeHeadV1.Layout[1].BytesWritten != 3+90 {
+		t.Fatalf("following testFileInode.externalizeInodeHeadV1Layout(), testFileInode.inodeHeadV1.Layout[1].BytesWritten was unexpected: %v", testFileInode.inodeHeadV1.Layout[1].BytesWritten)
 	}
 	if testFileInode.inodeHeadV1.Layout[1].BytesReferenced != 3+90 {
 		t.Fatalf("following testFileInode.externalizeInodeHeadV1Layout(), testFileInode.inodeHeadV1.Layout[1].BytesReferenced was unexpected: %v", testFileInode.inodeHeadV1.Layout[1].BytesReferenced)
@@ -1114,7 +1154,7 @@ func TestRetryRPC(t *testing.T) {
 			},
 		},
 		SuperBlockInodeObjectCountAdjustment:     testFileInode.superBlockInodeObjectCountAdjustment,
-		SuperBlockInodeObjectSizeAdjustment:      testFileInode.superBlockInodeObjectSizeAdjustment,
+		SuperBlockInodeBytesWrittenAdjustment:    testFileInode.superBlockInodeBytesWrittenAdjustment,
 		SuperBlockInodeBytesReferencedAdjustment: testFileInode.superBlockInodeBytesReferencedAdjustment,
 		DereferencedObjectNumberArray:            testFileInode.dereferencedObjectNumberArray,
 	}
@@ -1137,15 +1177,19 @@ func TestRetryRPC(t *testing.T) {
 		t.Fatalf("retryrpcClient.Send(\"Flush()\",,) failed: %v", err)
 	}
 
-	// TODO: Remove this early exit skipping of following TODOs
+	// Verify that 1st Object for FileInode gets deleted... but not 2nd nor 3rd
 
-	if nil == err {
-		t.Logf("Exiting TestRetryRPC() early to skip following TODOs")
-		return
+	if objectNumberIsPresent(t, mountResponse.MountID, fileInodeObjectA) {
+		t.Fatalf("fileInodeObjectA should have been absent")
 	}
 
-	// TODO: Verify that 1st Object for FileInode gets deleted... but not 2nd nor 3rd
-	//       Note that this requires a checkpoint & async deletes to have completed
+	if !objectNumberIsPresent(t, mountResponse.MountID, fileInodeObjectB) {
+		t.Fatalf("fileInodeObjectB should have been present")
+	}
+
+	if !objectNumberIsPresent(t, mountResponse.MountID, fileInodeObjectC) {
+		t.Fatalf("fileInodeObjectC should have been present")
+	}
 
 	// Perform an AdjustInodeTableEntryOpenCount(+1) for FileInode
 
@@ -1186,7 +1230,14 @@ func TestRetryRPC(t *testing.T) {
 		t.Fatalf("retryrpcClient.Send(\"Flush()\",,) failed: %v", err)
 	}
 
-	// TODO: Verify that FileInode is still in InodeTable
+	// Verify that FileInode is still in InodeTable
+
+	currentInodeNumberSet = fetchCurrentInodeNumberInInodeTableSet(t, mountResponse.MountID)
+
+	_, ok = currentInodeNumberSet[fileInodeNumber]
+	if !ok {
+		t.Fatalf("fileInodeNumber should have been present")
+	}
 
 	// Perform an AdjustInodeTableEntryOpenCount(-1) for FileInode
 
@@ -1202,19 +1253,20 @@ func TestRetryRPC(t *testing.T) {
 		t.Fatalf("retryrpcClient.Send(\"AdjustInodeTableEntryOpenCount(,fileInodeNumber,-1)\",,) failed: %v", err)
 	}
 
-	// Perform a Flush()
+	// Verify that we get an RPCInterrupt due to FileInode being deleted
 
-	flushRequest = &FlushRequestStruct{
-		MountID: mountResponse.MountID,
-	}
-	flushResponse = &FlushResponseStruct{}
+	rpcInterruptPayload = <-retryrpcClientCallbacks.interruptPayloadChan
 
-	err = retryrpcClient.Send("Flush", flushRequest, flushResponse)
+	rpcInterrupt = &RPCInterrupt{}
+
+	err = json.Unmarshal(rpcInterruptPayload, rpcInterrupt)
 	if nil != err {
-		t.Fatalf("retryrpcClient.Send(\"Flush()\",,) failed: %v", err)
+		t.Fatalf("json.Unmarshal(rpcInterruptPayload, rpcInterrupt) failed: %v", err)
 	}
 
-	// TODO: Verify that FileInode is no longer in InodeTable and 2nd and 3rd Objects are deleted
+	if (rpcInterrupt.RPCInterruptType != RPCInterruptTypeRelease) || (rpcInterrupt.InodeNumber != fileInodeNumber) {
+		t.Fatalf("unexpected rpcInterrupt: %+v", rpcInterrupt)
+	}
 
 	// Perform a Lease Release on FileInode
 
@@ -1230,6 +1282,51 @@ func TestRetryRPC(t *testing.T) {
 		t.Fatalf("retryrpcClient.Send(\"Lease(,fileInodeNumber,LeaseRequestTypeRelease)\",,) failed: %v", err)
 	}
 
+	// Verify that a Lease was released on fileInodeNumber
+
+	currentInodeNumberSet = fetchCurrentInodeNumberInInodeLeaseMapSet(t, mountResponse.MountID)
+
+	if len(currentInodeNumberSet) != 1 {
+		t.Fatalf("currentInodeNumberSet should have had two elements")
+	}
+	_, ok = currentInodeNumberSet[ilayout.RootDirInodeNumber]
+	if !ok {
+		t.Fatalf("ilayout.RootDirInodeNumber should have been present")
+	}
+	_, ok = currentInodeNumberSet[fileInodeNumber]
+	if ok {
+		t.Fatalf("fileInodeNumber should have been absent")
+	}
+
+	// Perform a Flush()
+
+	flushRequest = &FlushRequestStruct{
+		MountID: mountResponse.MountID,
+	}
+	flushResponse = &FlushResponseStruct{}
+
+	err = retryrpcClient.Send("Flush", flushRequest, flushResponse)
+	if nil != err {
+		t.Fatalf("retryrpcClient.Send(\"Flush()\",,) failed: %v", err)
+	}
+
+	// Verify that FileInode is no longer in InodeTable and 2nd and 3rd Objects are deleted
+
+	currentInodeNumberSet = fetchCurrentInodeNumberInInodeTableSet(t, mountResponse.MountID)
+
+	_, ok = currentInodeNumberSet[fileInodeNumber]
+	if ok {
+		t.Fatalf("fileInodeNumber should have been absent")
+	}
+
+	if objectNumberIsPresent(t, mountResponse.MountID, fileInodeObjectB) {
+		t.Fatalf("fileInodeObjectB should have been absent")
+	}
+
+	if objectNumberIsPresent(t, mountResponse.MountID, fileInodeObjectC) {
+		t.Fatalf("fileInodeObjectC should have been absent")
+	}
+
 	// Perform an Unmount()... without first releasing Exclusive Lease on RootDirInode
 
 	unmountRequest = &UnmountRequestStruct{
@@ -1242,7 +1339,14 @@ func TestRetryRPC(t *testing.T) {
 		t.Fatalf("retryrpcClient.Send(\"Unmount()\",,) failed: %v", err)
 	}
 
-	// TODO: Verify that Exclusive Lease on RootDirInode is implicitly released
+	// Verify that Exclusive Lease on RootDirInode is implicitly released
+
+	currentInodeNumberSet = fetchCurrentInodeNumberInInodeLeaseMapSet(t, mountResponse.MountID)
+
+	_, ok = currentInodeNumberSet[ilayout.RootDirInodeNumber]
+	if ok {
+		t.Fatalf("ilayout.RootDirInodeNumber should have been absent")
+	}
 
 	// Teardown RetryRPC Client
 
@@ -1251,4 +1355,151 @@ func TestRetryRPC(t *testing.T) {
 	// And teardown test environment
 
 	testTeardown(t)
+}
+
+func fetchCurrentInodeNumberInInodeLeaseMapSet(t *testing.T, mountID string) (inodeNumberSet map[uint64]struct{}) {
+	var (
+		inodeNumber uint64
+		ok          bool
+		testMount   *mountStruct
+	)
+
+	inodeNumberSet = make(map[uint64]struct{})
+
+	globals.Lock()
+
+	testMount, ok = globals.mountMap[mountID]
+	if !ok {
+		t.Fatalf("globals.mountMap[mountID] returned !ok")
+	}
+
+	for inodeNumber = range testMount.volume.inodeLeaseMap {
+		inodeNumberSet[inodeNumber] = struct{}{}
+	}
+
+	globals.Unlock()
+
+	return
+}
+
+func fetchCurrentInodeNumberInInodeTableSet(t *testing.T, mountID string) (inodeNumberSet map[uint64]struct{}) {
+	var (
+		err              error
+		inodeNumber      uint64
+		inodeNumberAsKey sortedmap.Key
+		inodeTableIndex  int
+		inodeTableLen    int
+		ok               bool
+		testMount        *mountStruct
+	)
+
+	inodeNumberSet = make(map[uint64]struct{})
+
+	globals.Lock()
+
+	testMount, ok = globals.mountMap[mountID]
+	if !ok {
+		t.Fatalf("globals.mountMap[mountID] returned !ok")
+	}
+
+	inodeTableLen, err = testMount.volume.inodeTable.Len()
+	if nil != err {
+		t.Fatalf("testMount.volume.inodeTable.Len() failed: %v", err)
+	}
+
+	for inodeTableIndex = 0; inodeTableIndex < inodeTableLen; inodeTableIndex++ {
+		inodeNumberAsKey, _, ok, err = testMount.volume.inodeTable.GetByIndex(inodeTableIndex)
+		inodeNumber, ok = inodeNumberAsKey.(uint64)
+		if !ok {
+			t.Fatalf("inodeNumberAsKey.(uint64) returned !ok")
+		}
+		inodeNumberSet[inodeNumber] = struct{}{}
+	}
+
+	globals.Unlock()
+
+	return
+}
+
+func objectNumberIsPresent(t *testing.T, mountID string, objectNumber uint64) (present bool) {
+	var (
+		activeDeleteObjectNumber             uint64
+		activeDeleteObjectNumberListElement  *list.Element
+		err                                  error
+		headRequestHeaders                   http.Header
+		objectURL                            string
+		ok                                   bool
+		pendingDeleteObjectNumber            uint64
+		pendingDeleteObjectNumberListElement *list.Element
+		testMount                            *mountStruct
+	)
+
+	globals.Lock()
+
+	testMount, ok = globals.mountMap[mountID]
+	if !ok {
+		t.Fatal("globals.mountMap[mountID] returned !ok")
+	}
+
+	activeDeleteObjectNumberListElement = testMount.volume.activeDeleteObjectNumberList.Front()
+
+	for activeDeleteObjectNumberListElement != nil {
+		activeDeleteObjectNumber, ok = activeDeleteObjectNumberListElement.Value.(uint64)
+		if !ok {
+			t.Fatalf("activeDeleteObjectNumberListElement.Value.(uint64) returned !ok")
+		}
+
+		if objectNumber == activeDeleteObjectNumber {
+			globals.Unlock()
+			present = false
+			return
+		}
+
+		activeDeleteObjectNumberListElement = activeDeleteObjectNumberListElement.Next()
+	}
+
+	pendingDeleteObjectNumberListElement = testMount.volume.pendingDeleteObjectNumberList.Front()
+
+	for pendingDeleteObjectNumberListElement != nil {
+		pendingDeleteObjectNumber, ok = pendingDeleteObjectNumberListElement.Value.(uint64)
+		if !ok {
+			t.Fatalf("pendingDeleteObjectNumberListElement.Value.(uint64) returned !ok")
+		}
+
+		if objectNumber == pendingDeleteObjectNumber {
+			globals.Unlock()
+			present = false
+			return
+		}
+
+		pendingDeleteObjectNumberListElement = pendingDeleteObjectNumberListElement.Next()
+	}
+
+	globals.Unlock()
+
+	headRequestHeaders = make(http.Header)
+
+	headRequestHeaders["X-Auth-Token"] = []string{testGlobals.authToken}
+
+	objectURL = testGlobals.containerURL + "/" + ilayout.GetObjectNameAsString(objectNumber)
+
+	_, _, err = testDoHTTPRequest("HEAD", objectURL, headRequestHeaders, nil, http.StatusOK)
+	if nil == err {
+		present = true
+		return
+	}
+	_, _, err = testDoHTTPRequest("HEAD", objectURL, headRequestHeaders, nil, http.StatusNoContent)
+	if nil == err {
+		present = true
+		return
+	}
+	_, _, err = testDoHTTPRequest("HEAD", objectURL, headRequestHeaders, nil, http.StatusNotFound)
+	if nil == err {
+		present = false
+		return
+	}
+
+	t.Fatalf("testDoHTTPRequest(\"HEAD\", objectURL, headRequestHeaders, nil, http.Status{OK|NoContent|NotFound}) all failed")
+
+	return // Though this will never be reached
 }

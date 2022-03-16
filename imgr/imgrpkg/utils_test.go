@@ -54,9 +54,9 @@ type testGlobalsStruct struct {
 
 var testGlobals *testGlobalsStruct
 
-func testSetup(t *testing.T, retryrpcCallbacks interface{}) {
+func testSetup(t *testing.T, overrideConfStrings []string, retryrpcCallbacks interface{}) {
 	var (
-		confStrings                []string
+		defaultConfStrings         []string
 		err                        error
 		putAccountRequestHeaders   http.Header
 		putContainerRequestHeaders http.Header
@@ -118,7 +118,7 @@ func testSetup(t *testing.T, retryrpcCallbacks interface{}) {
 		t.Fatalf("icertpkg.GenEndpointCert() failed: %v", err)
 	}
 
-	confStrings = []string{
+	defaultConfStrings = []string{
 		"IMGR.PublicIPAddr=" + testIPAddr,
 		"IMGR.PrivateIPAddr=" + testIPAddr,
 		"IMGR.RetryRPCPort=" + fmt.Sprintf("%d", testRetryRPCPort),
@@ -137,6 +137,8 @@ func testSetup(t *testing.T, retryrpcCallbacks interface{}) {
 		"IMGR.AuthTokenCheckInterval=1m",
 
 		"IMGR.FetchNonceRangeToReturn=100",
+
+		"IMGR.OpenFileLimit=100000",
 
 		"IMGR.MinLeaseDuration=250ms",
 		"IMGR.LeaseInterruptInterval=250ms",
@@ -162,6 +164,7 @@ func testSetup(t *testing.T, retryrpcCallbacks interface{}) {
 		"IMGR.LogFilePath=",
 		"IMGR.LogToConsole=true",
 		"IMGR.TraceEnabled=false",
+		"IMGR.RetryRPCLogEnabled=false",
 
 		"ISWIFT.SwiftProxyIPAddr=" + testIPAddr,
 		"ISWIFT.SwiftProxyTCPPort=" + fmt.Sprintf("%d", testSwiftProxyTCPPort),
@@ -173,9 +176,16 @@ func testSetup(t *testing.T, retryrpcCallbacks interface{}) {
 		"ISWIFT.ContainerListingLimit=10000",
 	}
 
-	testGlobals.confMap, err = conf.MakeConfMapFromStrings(confStrings)
+	testGlobals.confMap, err = conf.MakeConfMapFromStrings(defaultConfStrings)
 	if nil != err {
-		t.Fatalf("conf.MakeConfMapFromStrings(confStrings) failed: %v", err)
+		t.Fatalf("conf.MakeConfMapFromStrings(defaultConfStrings) failed: %v", err)
+	}
+
+	if nil != overrideConfStrings {
+		err = testGlobals.confMap.UpdateFromStrings(overrideConfStrings)
+		if nil != err {
+			t.Fatalf("testGlobals.confMap.UpdateFromStrings(overrideConfStrings) failed: %v", err)
+		}
 	}
 
 	err = iswiftpkg.Start(testGlobals.confMap)
@@ -194,18 +204,18 @@ func testSetup(t *testing.T, retryrpcCallbacks interface{}) {
 
 	putAccountRequestHeaders["X-Auth-Token"] = []string{testGlobals.authToken}
 
-	_, _, err = testDoHTTPRequest("PUT", testGlobals.accountURL, putAccountRequestHeaders, nil)
+	_, _, err = testDoHTTPRequest("PUT", testGlobals.accountURL, putAccountRequestHeaders, nil, http.StatusCreated)
 	if nil != err {
-		t.Fatalf("testDoHTTPRequest(\"PUT\", testGlobals.accountURL, putAccountRequestHeaders) failed: %v", err)
+		t.Fatalf("testDoHTTPRequest(\"PUT\", testGlobals.accountURL, putAccountRequestHeaders, http.StatusCreated) failed: %v", err)
 	}
 
 	putContainerRequestHeaders = make(http.Header)
 
 	putContainerRequestHeaders["X-Auth-Token"] = []string{testGlobals.authToken}
 
-	_, _, err = testDoHTTPRequest("PUT", testGlobals.containerURL, putContainerRequestHeaders, nil)
+	_, _, err = testDoHTTPRequest("PUT", testGlobals.containerURL, putContainerRequestHeaders, nil, http.StatusCreated)
 	if nil != err {
-		t.Fatalf("testDoHTTPRequest(\"PUT\", testGlobals.storageURL, putContainerRequestHeaders) failed: %v", err)
+		t.Fatalf("testDoHTTPRequest(\"PUT\", testGlobals.storageURL, putContainerRequestHeaders, http.StatusCreated) failed: %v", err)
 	}
 
 	err = Start(testGlobals.confMap)
@@ -255,7 +265,7 @@ func testTeardown(t *testing.T) {
 	testGlobals = nil
 }
 
-func testDoHTTPRequest(method string, url string, requestHeaders http.Header, requestBody io.Reader) (responseHeaders http.Header, responseBody []byte, err error) {
+func testDoHTTPRequest(method string, url string, requestHeaders http.Header, requestBody io.Reader, expectedResponseStatusCode int) (responseHeaders http.Header, responseBody []byte, err error) {
 	var (
 		headerKey    string
 		headerValues []string
@@ -281,6 +291,8 @@ func testDoHTTPRequest(method string, url string, requestHeaders http.Header, re
 		return
 	}
 
+	responseHeaders = httpResponse.Header
+
 	responseBody, err = ioutil.ReadAll(httpResponse.Body)
 	if nil != err {
 		err = fmt.Errorf("ioutil.ReadAll(httpResponse.Body) failed: %v", err)
@@ -292,12 +304,10 @@ func testDoHTTPRequest(method string, url string, requestHeaders http.Header, re
 		return
 	}
 
-	if (200 > httpResponse.StatusCode) || (299 < httpResponse.StatusCode) {
-		err = fmt.Errorf("httpResponse.StatusCode unexpected: %s", httpResponse.Status)
+	if httpResponse.StatusCode != expectedResponseStatusCode {
+		err = fmt.Errorf("httpResponse.Status unexpected: %s", httpResponse.Status)
 		return
 	}
-
-	responseHeaders = httpResponse.Header
 
 	err = nil
 	return
@@ -314,7 +324,7 @@ func testDoAuth() (err error) {
 	authRequestHeaders["X-Auth-User"] = []string{testSwiftAuthUser}
 	authRequestHeaders["X-Auth-Key"] = []string{testSwiftAuthKey}
 
-	authResponseHeaders, _, err = testDoHTTPRequest("GET", testGlobals.authURL, authRequestHeaders, nil)
+	authResponseHeaders, _, err = testDoHTTPRequest("GET", testGlobals.authURL, authRequestHeaders, nil, http.StatusOK)
 	if nil == err {
 		testGlobals.authToken = authResponseHeaders.Get("X-Auth-Token")
 		testGlobals.accountURL = authResponseHeaders.Get("X-Storage-Url")

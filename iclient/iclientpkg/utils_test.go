@@ -171,6 +171,7 @@ func testSetup(t *testing.T) {
 		"ICLIENT.LogToConsole=true",
 		"ICLIENT.TraceEnabled=false",
 		"ICLIENT.FUSELogEnabled=false",
+		"ICLIENT.RetryRPCLogEnabled=false",
 		"ICLIENT.HTTPServerIPAddr=" + testIPAddr,
 		"ICLIENT.HTTPServerPort=" + fmt.Sprintf("%d", testClientHTTPServerPort),
 
@@ -192,6 +193,8 @@ func testSetup(t *testing.T) {
 		"IMGR.AuthTokenCheckInterval=1m",
 
 		"IMGR.FetchNonceRangeToReturn=100",
+
+		"IMGR.OpenFileLimit=100000",
 
 		"IMGR.MinLeaseDuration=250ms",
 		"IMGR.LeaseInterruptInterval=250ms",
@@ -217,6 +220,7 @@ func testSetup(t *testing.T) {
 		"IMGR.LogFilePath=",
 		"IMGR.LogToConsole=true",
 		"IMGR.TraceEnabled=false",
+		"IMGR.RetryRPCLogEnabled=false",
 
 		"ISWIFT.SwiftProxyIPAddr=" + testIPAddr,
 		"ISWIFT.SwiftProxyTCPPort=" + fmt.Sprintf("%d", testSwiftProxyTCPPort),

@@ -134,18 +134,23 @@ func (inode *inodeStruct) PutNode(nodeByteSlice []byte) (objectNumber uint64, ob
 
 	layoutMapEntry, ok = inode.layoutMap[inode.putObjectNumber]
 	if !ok {
-		logFatalf("inode.layoutMap[inode.putObjectNumber] returned !ok")
+		layoutMapEntry = layoutMapEntryStruct{
+			bytesWritten:    0,
+			bytesReferenced: 0,
+		}
+
+		inode.superBlockInodeObjectCountAdjustment++
 	}
 
 	objectNumber = inode.putObjectNumber
 	objectOffset = uint64(len(inode.putObjectBuffer))
 
-	layoutMapEntry.objectSize += uint64(len(nodeByteSlice))
+	layoutMapEntry.bytesWritten += uint64(len(nodeByteSlice))
 	layoutMapEntry.bytesReferenced += uint64(len(nodeByteSlice))
 
 	inode.layoutMap[inode.putObjectNumber] = layoutMapEntry
 
-	inode.superBlockInodeObjectSizeAdjustment += int64(len(nodeByteSlice))
+	inode.superBlockInodeBytesWrittenAdjustment += int64(len(nodeByteSlice))
 	inode.superBlockInodeBytesReferencedAdjustment += int64(len(nodeByteSlice))
 
 	inode.putObjectBuffer = append(inode.putObjectBuffer, nodeByteSlice...)
@@ -176,25 +181,31 @@ func (inode *inodeStruct) DiscardNode(objectNumber uint64, objectOffset uint64, 
 	if objectLength > layoutMapEntry.bytesReferenced {
 		log.Fatalf("objectLength > layoutMapEntry.bytesReferenced")
 	}
-	if (objectOffset + objectLength) > layoutMapEntry.objectSize {
-		log.Fatalf("(objectOffset + objectLength) > layoutMapEntry.objectSize")
+	if (objectOffset + objectLength) > layoutMapEntry.bytesWritten {
+		log.Fatalf("(objectOffset + objectLength) > layoutMapEntry.bytesWritten")
 	}
 
 	// It's ok to update lauoutMap... but note that the above checks don't protect against all double deallocations
 
-	if (objectLength == layoutMapEntry.bytesReferenced) && (objectNumber != inode.putObjectNumber) {
-		// Note that we skip the special case where we are currently
-		// discarding the only referenced bytes in an active putObjectBuffer
-		// since a subsequent flush will write (at least) the inodeHeadV1 there
+	if objectLength == layoutMapEntry.bytesReferenced {
+		// We are completely dereferencing objectNumber...
 
 		delete(inode.layoutMap, objectNumber)
 
 		inode.superBlockInodeObjectCountAdjustment--
-		inode.superBlockInodeObjectSizeAdjustment -= int64(layoutMapEntry.objectSize)
+		inode.superBlockInodeBytesWrittenAdjustment -= int64(layoutMapEntry.bytesWritten)
 		inode.superBlockInodeBytesReferencedAdjustment -= int64(objectLength)
 
-		inode.dereferencedObjectNumberArray = append(inode.dereferencedObjectNumberArray, objectNumber)
+		if objectNumber == inode.putObjectNumber {
+			// We haven't put inode.putObjectNumber yet, so no need to delete it
+		} else {
+			// Ok to delete the object as it will be unrefenenced when we put inode.putObjectNumber during flush
+
+			inode.dereferencedObjectNumberArray = append(inode.dereferencedObjectNumberArray, objectNumber)
+		}
 	} else {
+		// Just update layoutMapEntry.bytesReferenced (that will still be non-zero)
+
 		layoutMapEntry.bytesReferenced -= objectLength
 
 		inode.layoutMap[objectNumber] = layoutMapEntry
@@ -547,7 +558,7 @@ func (inode *inodeStruct) convertInodeHeadV1LayoutToLayoutMap() {
 
 	for _, ilayoutInodeHeadLayoutEntryV1 = range inode.inodeHeadV1.Layout {
 		inode.layoutMap[ilayoutInodeHeadLayoutEntryV1.ObjectNumber] = layoutMapEntryStruct{
-			objectSize:      ilayoutInodeHeadLayoutEntryV1.ObjectSize,
+			bytesWritten:    ilayoutInodeHeadLayoutEntryV1.BytesWritten,
 			bytesReferenced: ilayoutInodeHeadLayoutEntryV1.BytesReferenced,
 		}
 	}
@@ -563,20 +574,20 @@ func (inode *inodeStruct) convertLayoutMapToInodeHeadV1Layout() {
 	inode.inodeHeadV1.Layout = make([]ilayout.InodeHeadLayoutEntryV1Struct, 0, len(inode.layoutMap))
 
 	for objectNumber, layoutMapEntry = range inode.layoutMap {
-		if layoutMapEntry.objectSize == 0 {
+		if layoutMapEntry.bytesWritten == 0 {
 			if layoutMapEntry.bytesReferenced != 0 {
-				logFatalf("(layoutMapEntry.objectSize == 0) && (layoutMapEntry.bytesReferenced != 0)")
+				logFatalf("(layoutMapEntry.bytesWritten == 0) && (layoutMapEntry.bytesReferenced != 0)")
 			}
 
 			layoutMapEntryToDeleteList = append(layoutMapEntryToDeleteList, objectNumber)
 		} else {
 			if layoutMapEntry.bytesReferenced == 0 {
-				logFatalf("(layoutMapEntry.objectSize != 0) && (layoutMapEntry.bytesReferenced == 0)")
+				logFatalf("(layoutMapEntry.bytesWritten != 0) && (layoutMapEntry.bytesReferenced == 0)")
 			}
 
 			inode.inodeHeadV1.Layout = append(inode.inodeHeadV1.Layout, ilayout.InodeHeadLayoutEntryV1Struct{
 				ObjectNumber:    objectNumber,
-				ObjectSize:      layoutMapEntry.objectSize,
+				BytesWritten:    layoutMapEntry.bytesWritten,
 				BytesReferenced: layoutMapEntry.bytesReferenced,
 			})
 		}
@@ -645,15 +656,6 @@ func (inode *inodeStruct) ensurePutObjectIsActive() {
 	if inode.putObjectNumber == 0 {
 		inode.putObjectNumber = fetchNonce()
 		inode.putObjectBuffer = make([]byte, 0)
-
-		inode.superBlockInodeObjectCountAdjustment++
-
-		inode.layoutMap[inode.putObjectNumber] = layoutMapEntryStruct{
-			objectSize:      0,
-			bytesReferenced: 0,
-		}
-
-		inode.superBlockInodeObjectCountAdjustment++
 	}
 }
 
@@ -823,7 +825,7 @@ func flushInodesInSlice(inodeSlice []*inodeStruct) {
 		MountID:                                  globals.mountID,
 		UpdatedInodeTableEntryArray:              make([]imgrpkg.PutInodeTableEntryStruct, len(inodeSlice)),
 		SuperBlockInodeObjectCountAdjustment:     0,
-		SuperBlockInodeObjectSizeAdjustment:      0,
+		SuperBlockInodeBytesWrittenAdjustment:    0,
 		SuperBlockInodeBytesReferencedAdjustment: 0,
 		DereferencedObjectNumberArray:            make([]uint64, 0),
 	}
@@ -841,7 +843,7 @@ func flushInodesInSlice(inodeSlice []*inodeStruct) {
 		putInodeTableEntriesRequest.UpdatedInodeTableEntryArray[inodeSliceIndex].InodeHeadLength = inodeHeadLength
 
 		putInodeTableEntriesRequest.SuperBlockInodeObjectCountAdjustment += inode.superBlockInodeObjectCountAdjustment
-		putInodeTableEntriesRequest.SuperBlockInodeObjectSizeAdjustment += inode.superBlockInodeObjectSizeAdjustment
+		putInodeTableEntriesRequest.SuperBlockInodeBytesWrittenAdjustment += inode.superBlockInodeBytesWrittenAdjustment
 		putInodeTableEntriesRequest.SuperBlockInodeBytesReferencedAdjustment += inode.superBlockInodeBytesReferencedAdjustment
 
 		putInodeTableEntriesRequest.DereferencedObjectNumberArray = append(putInodeTableEntriesRequest.DereferencedObjectNumberArray, inode.dereferencedObjectNumberArray...)
@@ -849,7 +851,7 @@ func flushInodesInSlice(inodeSlice []*inodeStruct) {
 		inode.dirty = false
 
 		inode.superBlockInodeObjectCountAdjustment = 0
-		inode.superBlockInodeObjectSizeAdjustment = 0
+		inode.superBlockInodeBytesWrittenAdjustment = 0
 		inode.superBlockInodeBytesReferencedAdjustment = 0
 
 		inode.dereferencedObjectNumberArray = make([]uint64, 0)
@@ -898,15 +900,20 @@ func (fileInode *inodeStruct) recordExtent(startingFileOffset uint64, length uin
 
 	layoutMapEntry, ok = fileInode.layoutMap[fileInode.putObjectNumber]
 	if !ok {
-		logFatalf("fileInode.layoutMap[inode.putObjectNumber] returned !ok")
+		layoutMapEntry = layoutMapEntryStruct{
+			bytesWritten:    0,
+			bytesReferenced: 0,
+		}
+
+		fileInode.superBlockInodeObjectCountAdjustment++
 	}
 
-	layoutMapEntry.objectSize += length
+	layoutMapEntry.bytesWritten += length
 	layoutMapEntry.bytesReferenced += length
 
 	fileInode.layoutMap[fileInode.putObjectNumber] = layoutMapEntry
 
-	fileInode.superBlockInodeObjectSizeAdjustment += int64(length)
+	fileInode.superBlockInodeBytesWrittenAdjustment += int64(length)
 	fileInode.superBlockInodeBytesReferencedAdjustment += int64(length)
 
 	index, found, err = fileInode.payload.BisectLeft(startingFileOffset)
@@ -1214,19 +1221,29 @@ func (fileInode *inodeStruct) unmapExtent(startingFileOffset uint64, length uint
 			logFatalf("fileInode.payload.DeleteByIndex() returned !ok")
 		}
 
-		// Update the layoutMapEntry... possibly deleting it if .bytesReferences reaches 0 (and it's not the current putObject)
+		// Update the layoutMapEntry... possibly deleting it if .bytesReferences reaches 0
 
 		layoutMapEntry.bytesReferenced -= extentMapEntryValueV1.Length
 
-		if (layoutMapEntry.bytesReferenced == 0) && (extentMapEntryValueV1.ObjectNumber != fileInode.putObjectNumber) {
+		if layoutMapEntry.bytesReferenced == 0 {
+			// We are completely dereferencing extentMapEntryValueV1.ObjectNumber
+
 			delete(fileInode.layoutMap, extentMapEntryValueV1.ObjectNumber)
 
 			fileInode.superBlockInodeObjectCountAdjustment--
-			fileInode.superBlockInodeObjectSizeAdjustment -= int64(layoutMapEntry.objectSize)
+			fileInode.superBlockInodeBytesWrittenAdjustment -= int64(layoutMapEntry.bytesWritten)
 			fileInode.superBlockInodeBytesReferencedAdjustment -= int64(extentMapEntryValueV1.Length)
 
-			fileInode.dereferencedObjectNumberArray = append(fileInode.dereferencedObjectNumberArray, extentMapEntryValueV1.ObjectNumber)
+			if extentMapEntryValueV1.ObjectNumber == fileInode.putObjectNumber {
+				// We haven't put inode.putObjectNumber yet, so no need to delete it
+			} else {
+				// Ok to delete the object as it will be unrefenenced when we put fileInode.putObjectNumber during flush
+
+				fileInode.dereferencedObjectNumberArray = append(fileInode.dereferencedObjectNumberArray, extentMapEntryValueV1.ObjectNumber)
+			}
 		} else {
+			// Just update layoutMapEntry.bytesReferenced (that will still be non-zero)
+
 			fileInode.layoutMap[extentMapEntryValueV1.ObjectNumber] = layoutMapEntry
 
 			fileInode.superBlockInodeBytesReferencedAdjustment -= int64(extentMapEntryValueV1.Length)

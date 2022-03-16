@@ -271,8 +271,8 @@ type volumeListGETEntryStruct struct {
 	StorageURL             string
 	AuthToken              string
 	HealthyMounts          uint64
-	LeasesExpiredMounts    uint64
 	AuthTokenExpiredMounts uint64
+	LeasesExpiredMounts    uint64
 }
 
 type volumeOrInodeGETDimensionStruct struct {
@@ -284,7 +284,7 @@ type volumeOrInodeGETDimensionStruct struct {
 
 type volumeOrInodeGETLayoutEntryStruct struct {
 	ObjectName      string // == ilayout.GetObjectNameAsString(ObjectNumber)
-	ObjectSize      uint64
+	BytesWritten    uint64
 	BytesReferenced uint64
 }
 
@@ -305,8 +305,8 @@ type volumeGETStruct struct {
 	StorageURL                   string
 	AuthToken                    string
 	HealthyMounts                uint64
-	LeasesExpiredMounts          uint64
 	AuthTokenExpiredMounts       uint64
+	LeasesExpiredMounts          uint64
 	SuperBlockObjectName         string // == ilayout.GetObjectNameAsString(SuperBlockObjectNumber)
 	SuperBlockLength             uint64
 	ReservedToNonce              uint64
@@ -316,10 +316,12 @@ type volumeGETStruct struct {
 	InodeTableHeight             uint64
 	InodeTableLayout             []volumeOrInodeGETLayoutEntryStruct
 	InodeObjectCount             uint64
-	InodeObjectSize              uint64
+	InodeBytesWritten            uint64
 	InodeBytesReferenced         uint64
 	PendingDeleteObjectNameArray []string // == []ilayout.GetObjectNameAsString(PendingDeleteObjectNumber)
 	InodeTable                   []volumeGETInodeTableEntryStruct
+	InodeOpenCount               uint64
+	InodeLeaseCount              uint64
 }
 
 type inodeGETLinkTableEntryStruct struct {
@@ -721,8 +723,8 @@ func serveHTTPGetOfVolume(responseWriter http.ResponseWriter, request *http.Requ
 				StorageURL:             volumeAsStruct.storageURL,
 				AuthToken:              volumeAsStruct.authToken,
 				HealthyMounts:          uint64(volumeAsStruct.healthyMountList.Len()),
-				LeasesExpiredMounts:    uint64(volumeAsStruct.leasesExpiredMountList.Len()),
 				AuthTokenExpiredMounts: uint64(volumeAsStruct.authTokenExpiredMountList.Len()),
+				LeasesExpiredMounts:    uint64(volumeAsStruct.leasesExpiredMountList.Len()),
 			}
 		}
 
@@ -826,8 +828,8 @@ func serveHTTPGetOfVolume(responseWriter http.ResponseWriter, request *http.Requ
 				StorageURL:                   volumeAsStruct.storageURL,
 				AuthToken:                    volumeAuthToken,
 				HealthyMounts:                uint64(volumeAsStruct.healthyMountList.Len()),
-				LeasesExpiredMounts:          uint64(volumeAsStruct.leasesExpiredMountList.Len()),
 				AuthTokenExpiredMounts:       uint64(volumeAsStruct.authTokenExpiredMountList.Len()),
+				LeasesExpiredMounts:          uint64(volumeAsStruct.leasesExpiredMountList.Len()),
 				SuperBlockObjectName:         ilayout.GetObjectNameAsString(checkPointV1.SuperBlockObjectNumber),
 				SuperBlockLength:             checkPointV1.SuperBlockLength,
 				ReservedToNonce:              checkPointV1.ReservedToNonce,
@@ -837,15 +839,17 @@ func serveHTTPGetOfVolume(responseWriter http.ResponseWriter, request *http.Requ
 				InodeTableHeight:             dimensionsReport.Height,
 				InodeTableLayout:             make([]volumeOrInodeGETLayoutEntryStruct, len(superBlockV1.InodeTableLayout)),
 				InodeObjectCount:             superBlockV1.InodeObjectCount,
-				InodeObjectSize:              superBlockV1.InodeObjectSize,
+				InodeBytesWritten:            superBlockV1.InodeBytesWritten,
 				InodeBytesReferenced:         superBlockV1.InodeBytesReferenced,
 				PendingDeleteObjectNameArray: make([]string, len(superBlockV1.PendingDeleteObjectNumberArray)),
 				InodeTable:                   make([]volumeGETInodeTableEntryStruct, dimensionsReport.Items),
+				InodeOpenCount:               uint64(len(volumeAsStruct.inodeOpenMap)),
+				InodeLeaseCount:              uint64(len(volumeAsStruct.inodeLeaseMap)),
 			}
 
 			for inodeTableLayoutIndex = range volumeGET.InodeTableLayout {
 				volumeGET.InodeTableLayout[inodeTableLayoutIndex].ObjectName = ilayout.GetObjectNameAsString(superBlockV1.InodeTableLayout[inodeTableLayoutIndex].ObjectNumber)
-				volumeGET.InodeTableLayout[inodeTableLayoutIndex].ObjectSize = superBlockV1.InodeTableLayout[inodeTableLayoutIndex].ObjectSize
+				volumeGET.InodeTableLayout[inodeTableLayoutIndex].BytesWritten = superBlockV1.InodeTableLayout[inodeTableLayoutIndex].BytesWritten
 				volumeGET.InodeTableLayout[inodeTableLayoutIndex].BytesReferenced = superBlockV1.InodeTableLayout[inodeTableLayoutIndex].BytesReferenced
 			}
 
@@ -1108,7 +1112,7 @@ func serveHTTPGetOfVolume(responseWriter http.ResponseWriter, request *http.Requ
 
 						for inodeGETLayoutEntryIndex = range inodeHeadV1.Layout {
 							inodeGET.(*dirInodeGETStruct).Layout[inodeGETLayoutEntryIndex].ObjectName = ilayout.GetObjectNameAsString(inodeHeadV1.Layout[inodeGETLayoutEntryIndex].ObjectNumber)
-							inodeGET.(*dirInodeGETStruct).Layout[inodeGETLayoutEntryIndex].ObjectSize = inodeHeadV1.Layout[inodeGETLayoutEntryIndex].ObjectSize
+							inodeGET.(*dirInodeGETStruct).Layout[inodeGETLayoutEntryIndex].BytesWritten = inodeHeadV1.Layout[inodeGETLayoutEntryIndex].BytesWritten
 							inodeGET.(*dirInodeGETStruct).Layout[inodeGETLayoutEntryIndex].BytesReferenced = inodeHeadV1.Layout[inodeGETLayoutEntryIndex].BytesReferenced
 						}
 					case ilayout.InodeTypeFile:
@@ -1200,7 +1204,7 @@ func serveHTTPGetOfVolume(responseWriter http.ResponseWriter, request *http.Requ
 
 						for inodeGETLayoutEntryIndex = range inodeHeadV1.Layout {
 							inodeGET.(*fileInodeGETStruct).Layout[inodeGETLayoutEntryIndex].ObjectName = ilayout.GetObjectNameAsString(inodeHeadV1.Layout[inodeGETLayoutEntryIndex].ObjectNumber)
-							inodeGET.(*fileInodeGETStruct).Layout[inodeGETLayoutEntryIndex].ObjectSize = inodeHeadV1.Layout[inodeGETLayoutEntryIndex].ObjectSize
+							inodeGET.(*fileInodeGETStruct).Layout[inodeGETLayoutEntryIndex].BytesWritten = inodeHeadV1.Layout[inodeGETLayoutEntryIndex].BytesWritten
 							inodeGET.(*fileInodeGETStruct).Layout[inodeGETLayoutEntryIndex].BytesReferenced = inodeHeadV1.Layout[inodeGETLayoutEntryIndex].BytesReferenced
 						}
 					case ilayout.InodeTypeSymLink:

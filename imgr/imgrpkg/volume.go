@@ -108,7 +108,9 @@ func startVolumeManagement() (err error) {
 	}
 
 	globals.inodeTableCache = sortedmap.NewBPlusTreeCache(globals.config.InodeTableCacheEvictLowLimit, globals.config.InodeTableCacheEvictLowLimit)
+	globals.inodeOpenCount = 0
 	globals.inodeLeaseLRU = list.New()
+	globals.inodeLeaseExpirerWG = nil
 	globals.volumeMap = sortedmap.NewLLRBTree(sortedmap.CompareString, &globals)
 	globals.mountMap = make(map[string]*mountStruct)
 
@@ -176,7 +178,9 @@ func stopVolumeManagement() (err error) {
 	globals.checkPointURL = nil
 
 	globals.inodeTableCache = nil
+	globals.inodeOpenCount = 0
 	globals.inodeLeaseLRU = nil
+	globals.inodeLeaseExpirerWG = nil
 	globals.volumeMap = nil
 	globals.mountMap = nil
 
@@ -652,7 +656,7 @@ func postVolume(storageURL string, authToken string) (err error) {
 		Layout: []ilayout.InodeHeadLayoutEntryV1Struct{
 			{
 				ObjectNumber:    rootDirInodeObjectNumber,
-				ObjectSize:      uint64(len(postVolumeRootDirDirectoryCallbacks.body)),
+				BytesWritten:    uint64(len(postVolumeRootDirDirectoryCallbacks.body)),
 				BytesReferenced: uint64(len(postVolumeRootDirDirectoryCallbacks.body)),
 			},
 		},
@@ -710,13 +714,13 @@ func postVolume(storageURL string, authToken string) (err error) {
 		InodeTableLayout: []ilayout.InodeTableLayoutEntryV1Struct{
 			{
 				ObjectNumber:    superBlockObjectNumber,
-				ObjectSize:      uint64(len(postVolumeSuperBlockInodeTableCallbacks.body)),
+				BytesWritten:    uint64(len(postVolumeSuperBlockInodeTableCallbacks.body)),
 				BytesReferenced: uint64(len(postVolumeSuperBlockInodeTableCallbacks.body)),
 			},
 		},
 		InodeObjectCount:     1,
-		InodeObjectSize:      uint64(len(postVolumeRootDirDirectoryCallbacks.body)),
-		InodeBytesReferenced: uint64(len(postVolumeRootDirDirectoryCallbacks.body)),
+		InodeBytesWritten:    rootDirInodeHeadV1.Layout[0].BytesWritten,
+		InodeBytesReferenced: rootDirInodeHeadV1.Layout[0].BytesReferenced,
 	}
 
 	superBlockV1Buf, err = superBlockV1.MarshalSuperBlockV1()
@@ -767,8 +771,8 @@ func putVolume(name string, storageURL string, authToken string) (err error) {
 		authToken:                     authToken,
 		mountMap:                      make(map[string]*mountStruct),
 		healthyMountList:              list.New(),
-		leasesExpiredMountList:        list.New(),
 		authTokenExpiredMountList:     list.New(),
+		leasesExpiredMountList:        list.New(),
 		deleting:                      false,
 		checkPoint:                    nil,
 		superBlock:                    nil,
@@ -909,7 +913,7 @@ func (volume *volumeStruct) doCheckPoint() (err error) {
 	for objectNumber, inodeTableLayoutElement = range volume.inodeTableLayout {
 		volume.superBlock.InodeTableLayout = append(volume.superBlock.InodeTableLayout, ilayout.InodeTableLayoutEntryV1Struct{
 			ObjectNumber:    objectNumber,
-			ObjectSize:      inodeTableLayoutElement.objectSize,
+			BytesWritten:    inodeTableLayoutElement.bytesWritten,
 			BytesReferenced: inodeTableLayoutElement.bytesReferenced,
 		})
 	}
@@ -1141,11 +1145,11 @@ func (volume *volumeStruct) PutNode(nodeByteSlice []byte) (objectNumber uint64, 
 
 	inodeTableLayoutElement, ok = volume.inodeTableLayout[volume.checkPointObjectNumber]
 	if ok {
-		inodeTableLayoutElement.objectSize += uint64(len(nodeByteSlice))
+		inodeTableLayoutElement.bytesWritten += uint64(len(nodeByteSlice))
 		inodeTableLayoutElement.bytesReferenced += uint64(len(nodeByteSlice))
 	} else {
 		inodeTableLayoutElement = &inodeTableLayoutElementStruct{
-			objectSize:      uint64(len(nodeByteSlice)),
+			bytesWritten:    uint64(len(nodeByteSlice)),
 			bytesReferenced: uint64(len(nodeByteSlice)),
 		}
 
@@ -1328,7 +1332,7 @@ func (volume *volumeStruct) fetchInodeHeadWhileLocked(inodeHeadObjectNumber uint
 	return
 }
 
-func (volume *volumeStruct) statusWhileLocked() (numInodes uint64, objectCount uint64, objectSize uint64, bytesReferenced uint64) {
+func (volume *volumeStruct) statusWhileLocked() (numInodes uint64, objectCount uint64, bytesWritten uint64, bytesReferenced uint64) {
 	var (
 		err           error
 		inodeTableLen int
@@ -1341,7 +1345,7 @@ func (volume *volumeStruct) statusWhileLocked() (numInodes uint64, objectCount u
 	numInodes = uint64(inodeTableLen)
 
 	objectCount = volume.superBlock.InodeObjectCount
-	objectSize = volume.superBlock.InodeObjectSize
+	bytesWritten = volume.superBlock.InodeBytesWritten
 	bytesReferenced = volume.superBlock.InodeBytesReferenced
 
 	return
@@ -1393,6 +1397,7 @@ func (volume *volumeStruct) removeInodeWhileLocked(inodeNumber uint64) {
 		inodeHeadObjectNumberInLayout bool
 		inodeHeadV1                   *ilayout.InodeHeadV1Struct
 		inodeHeadV1Buf                []byte
+		inodeLease                    *inodeLeaseStruct
 		inodeTableEntryValue          ilayout.InodeTableEntryValueV1Struct
 		inodeTableEntryValueRaw       sortedmap.Value
 		ok                            bool
@@ -1430,7 +1435,7 @@ func (volume *volumeStruct) removeInodeWhileLocked(inodeNumber uint64) {
 		_ = volume.pendingDeleteObjectNumberList.PushBack(inodeHeadLayoutEntryV1.ObjectNumber)
 
 		volume.superBlock.InodeObjectCount--
-		volume.superBlock.InodeObjectSize -= inodeHeadLayoutEntryV1.ObjectSize
+		volume.superBlock.InodeBytesWritten -= inodeHeadLayoutEntryV1.BytesWritten
 		volume.superBlock.InodeBytesReferenced -= inodeHeadLayoutEntryV1.BytesReferenced
 
 		if inodeHeadLayoutEntryV1.ObjectNumber == inodeTableEntryValue.InodeHeadObjectNumber {
@@ -1448,6 +1453,14 @@ func (volume *volumeStruct) removeInodeWhileLocked(inodeNumber uint64) {
 	}
 	if !ok {
 		logFatalf("volume.inodeTable.DeleteByKey(inodeNumber: %016X) returned !ok", inodeNumber)
+	}
+
+	inodeLease, ok = volume.inodeLeaseMap[inodeNumber]
+	if ok {
+		if !inodeLease.stopping {
+			inodeLease.stopping = true
+			close(inodeLease.stopChan)
+		}
 	}
 }
 
@@ -1635,24 +1648,9 @@ func (volume *volumeStruct) checkPointReadOnce(checkPointObjectURL string) (buf 
 				logWarnf("checkPointReadOnce(checkPointObjectURL,volume.authToken) returned !authOK for volume %s...clearing volume.authToken", volume.name)
 				volume.authToken = ""
 			} else {
-				mount.authTokenExpired = true
-
-				// It's possible that mount has "moved" from volume.healthyMountList
-
-				switch mount.mountListMembership {
-				case onHealthyMountList:
-					_ = mount.volume.healthyMountList.Remove(mount.mountListElement)
-					mount.mountListElement = mount.volume.authTokenExpiredMountList.PushBack(mount)
-					mount.mountListMembership = onAuthTokenExpiredMountList
-				case onLeasesExpiredMountList:
-					_ = mount.volume.leasesExpiredMountList.Remove(mount.mountListElement)
-					mount.mountListElement = mount.volume.authTokenExpiredMountList.PushBack(mount)
-					mount.mountListMembership = onAuthTokenExpiredMountList
-				case onAuthTokenExpiredMountList:
-					volume.authTokenExpiredMountList.MoveToBack(mount.mountListElement)
-				default:
-					logFatalf("mount.mountListMembership (%v) not one of on{Healthy|LeasesExpired|AuthTokenExpired}MountList")
-				}
+				_ = mount.volume.healthyMountList.Remove(mount.mountListElement)
+				mount.mountListElement = mount.volume.authTokenExpiredMountList.PushBack(mount)
+				mount.mountListMembership = onAuthTokenExpiredMountList
 			}
 
 			err = fmt.Errorf("checkPointWriteOnce(checkPointObjectURL, authToken, body) returned !authOK")
@@ -1917,24 +1915,9 @@ func (volume *volumeStruct) checkPointWriteOnce(checkPointObjectURL string, body
 				logWarnf("swiftObjectPutOnce(checkPointObjectURL,volume.authToken,body) returned !authOK for volume %s...clearing volume.authToken", volume.name)
 				volume.authToken = ""
 			} else {
-				mount.authTokenExpired = true
-
-				// It's possible that mount has "moved" from volume.healthyMountList
-
-				switch mount.mountListMembership {
-				case onHealthyMountList:
-					_ = mount.volume.healthyMountList.Remove(mount.mountListElement)
-					mount.mountListElement = mount.volume.authTokenExpiredMountList.PushBack(mount)
-					mount.mountListMembership = onAuthTokenExpiredMountList
-				case onLeasesExpiredMountList:
-					_ = mount.volume.leasesExpiredMountList.Remove(mount.mountListElement)
-					mount.mountListElement = mount.volume.authTokenExpiredMountList.PushBack(mount)
-					mount.mountListMembership = onAuthTokenExpiredMountList
-				case onAuthTokenExpiredMountList:
-					volume.authTokenExpiredMountList.MoveToBack(mount.mountListElement)
-				default:
-					logFatalf("mount.mountListMembership (%v) not one of on{Healthy|LeasesExpired|AuthTokenExpired}MountList")
-				}
+				_ = mount.volume.healthyMountList.Remove(mount.mountListElement)
+				mount.mountListElement = mount.volume.authTokenExpiredMountList.PushBack(mount)
+				mount.mountListMembership = onAuthTokenExpiredMountList
 			}
 		}
 	}
@@ -2025,4 +2008,96 @@ func (volume *volumeStruct) checkPointWrite(body io.ReadSeeker) (authOK bool, er
 	err = fmt.Errorf("globals.config.CheckPointRetryLimit exceeded")
 
 	return
+}
+
+func (mount *mountStruct) performUnmount(unmountFinishedWG *sync.WaitGroup) {
+	var (
+		inodeNumber            uint64
+		inodeNumberList        *list.List
+		inodeNumberListElement *list.Element
+		inodeOpenMapElement    *inodeOpenMapElementStruct
+		leaseReleaseFinishedWG sync.WaitGroup
+		leaseRequest           *leaseRequestStruct
+		leaseRequestOperation  *leaseRequestOperationStruct
+		ok                     bool
+	)
+
+	globals.Lock()
+
+	inodeNumberList = list.New()
+
+	for inodeNumber = range mount.inodeOpenMap {
+		inodeNumberList.PushBack(inodeNumber)
+	}
+
+	for {
+		inodeNumberListElement = inodeNumberList.Front()
+		if inodeNumberListElement == nil {
+			break
+		}
+
+		inodeNumber, ok = inodeNumberListElement.Value.(uint64)
+		if !ok {
+			logFatalf("inodeNumberListElement.Value.(uint64) returned !ok")
+		}
+
+		inodeNumberList.Remove(inodeNumberListElement)
+		delete(mount.inodeOpenMap, inodeNumber)
+
+		inodeOpenMapElement, ok = mount.volume.inodeOpenMap[inodeNumber]
+		if !ok {
+			logFatalf("mount.volume.inodeOpenMap[inodeNumber] is missing")
+		}
+
+		inodeOpenMapElement.numMounts--
+		if inodeOpenMapElement.numMounts == 0 {
+			delete(mount.volume.inodeOpenMap, inodeNumber)
+			globals.inodeOpenCount--
+			if inodeOpenMapElement.markedForDeletion {
+				mount.volume.removeInodeWhileLocked(inodeNumber)
+			}
+		}
+	}
+
+	for _, leaseRequest = range mount.leaseRequestMap {
+		leaseRequestOperation = &leaseRequestOperationStruct{
+			mount:            mount,
+			inodeLease:       leaseRequest.inodeLease,
+			LeaseRequestType: LeaseRequestTypeRelease,
+			replyChan:        make(chan LeaseResponseType, 1),
+		}
+
+		leaseReleaseFinishedWG.Add(1)
+
+		go func(leaseRequestOperation *leaseRequestOperationStruct) {
+			leaseRequestOperation.inodeLease.handleOperation(leaseRequestOperation)
+			<-leaseRequestOperation.replyChan
+			leaseReleaseFinishedWG.Done()
+		}(leaseRequestOperation)
+	}
+
+	globals.Unlock()
+
+	leaseReleaseFinishedWG.Wait()
+
+	globals.Lock()
+
+	switch mount.mountListMembership {
+	case onHealthyMountList:
+		_ = mount.volume.healthyMountList.Remove(mount.mountListElement)
+	case onAuthTokenExpiredMountList:
+		_ = mount.volume.authTokenExpiredMountList.Remove(mount.mountListElement)
+	case onLeasesExpiredMountList:
+		_ = mount.volume.leasesExpiredMountList.Remove(mount.mountListElement)
+	default:
+		logFatalf("mount.mountListMembership (%v) not one of on{Healthy|AuthTokenExpired|LeasesExpired}MountList")
+	}
+
+	mount.volume.mountMapWG.Done()
+
+	globals.Unlock()
+
+	if unmountFinishedWG != nil {
+		unmountFinishedWG.Done()
+	}
 }

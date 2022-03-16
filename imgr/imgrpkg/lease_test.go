@@ -6,6 +6,7 @@ package imgrpkg
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"runtime"
 	"strings"
@@ -17,13 +18,15 @@ import (
 )
 
 const (
-	testRpcLeaseDelayAfterSendingRequest         = 10 * time.Millisecond
-	testRpcLeaseDelayBeforeSendingRequest        = 10 * time.Millisecond
-	testRpcLeaseMultiFirstInodeNumber     uint64 = 1
-	testRpcLeaseMultiNumInstances         uint64 = 5
-	testRpcLeaseSingleInodeNumber         uint64 = 1
-	testRpcLeaseSingleNumInstances        uint64 = 21 // 101 // Must be >= 4
-	testRpcLeaseTimeFormat                       = "15:04:05.000"
+	testRpcLeaseOverrideConfIMGRLeaseEvictHighLimit        = 3
+	testRpcLeaseOverrideConfIMGRLeaseEvictLowLimit         = 2
+	testRpcLeaseDelayAfterSendingRequest                   = 10 * time.Millisecond
+	testRpcLeaseDelayBeforeSendingRequest                  = 10 * time.Millisecond
+	testRpcLeaseMultiFirstInodeNumber               uint64 = 1
+	testRpcLeaseMultiNumInstances                   uint64 = 5
+	testRpcLeaseSingleInodeNumber                   uint64 = 1
+	testRpcLeaseSingleNumInstances                  uint64 = 21 // 101 // Must be >= 4
+	testRpcLeaseTimeFormat                                 = "15:04:05.000"
 )
 
 var (
@@ -45,34 +48,40 @@ type testRpcLeaseClientStruct struct {
 
 func TestRPCLease(t *testing.T) {
 	var (
-		err                error
-		instance           uint64
-		postRequestBody    string
-		putRequestBody     string
-		testRpcLeaseClient []*testRpcLeaseClientStruct
-		wg                 sync.WaitGroup
+		err                 error
+		instance            uint64
+		overrideConfStrings []string
+		postRequestBody     string
+		putRequestBody      string
+		testRpcLeaseClient  []*testRpcLeaseClientStruct
+		wg                  sync.WaitGroup
 	)
 
 	// Setup test environment
 
-	testSetup(t, nil)
+	overrideConfStrings = []string{
+		fmt.Sprintf("IMGR.LeaseEvictLowLimit=%d", testRpcLeaseOverrideConfIMGRLeaseEvictLowLimit),
+		fmt.Sprintf("IMGR.LeaseEvictHighLimit=%d", testRpcLeaseOverrideConfIMGRLeaseEvictHighLimit),
+	}
+
+	testSetup(t, overrideConfStrings, nil)
 
 	// Format testVolume
 
 	postRequestBody = fmt.Sprintf("{\"StorageURL\":\"%s\",\"AuthToken\":\"%s\"}", testGlobals.containerURL, testGlobals.authToken)
 
-	_, _, err = testDoHTTPRequest("POST", testGlobals.httpServerURL+"/volume", nil, strings.NewReader(postRequestBody))
+	_, _, err = testDoHTTPRequest("POST", testGlobals.httpServerURL+"/volume", nil, strings.NewReader(postRequestBody), http.StatusCreated)
 	if nil != err {
-		t.Fatalf("testDoHTTPRequest(\"POST\", testGlobals.httpServerURL+\"/volume\", nil, strings.NewReader(postRequestBody)) failed: %v", err)
+		t.Fatalf("testDoHTTPRequest(\"POST\", testGlobals.httpServerURL+\"/volume\", nil, strings.NewReader(postRequestBody), http.StatusCreated) failed: %v", err)
 	}
 
 	// Start serving testVolume
 
 	putRequestBody = fmt.Sprintf("{\"StorageURL\":\"%s\"}", testGlobals.containerURL)
 
-	_, _, err = testDoHTTPRequest("PUT", testGlobals.httpServerURL+"/volume/"+testVolume, nil, strings.NewReader(putRequestBody))
+	_, _, err = testDoHTTPRequest("PUT", testGlobals.httpServerURL+"/volume/"+testVolume, nil, strings.NewReader(putRequestBody), http.StatusCreated)
 	if nil != err {
-		t.Fatalf("testDoHTTPRequest(\"PUT\", testGlobals.httpServerURL+\"/volume\"+testVolume, nil, strings.NewReader(putRequestBody)) failed: %v", err)
+		t.Fatalf("testDoHTTPRequest(\"PUT\", testGlobals.httpServerURL+\"/volume\"+testVolume, nil, strings.NewReader(putRequestBody), http.StatusCreated) failed: %v", err)
 	}
 
 	// Setup Single Lease instances
@@ -247,9 +256,7 @@ func TestRPCLease(t *testing.T) {
 	testRpcLeaseClient[1].sendLeaseRequest(LeaseRequestTypeRelease)
 	testRpcLeaseClient[1].validateChOutValueIsLeaseResponseType(LeaseResponseTypeReleased)
 
-	// TODO: testRpcLeaseClient[0].alreadyUnmounted = true
-	//
-	//       The above expiration should ultimately trigger an implicit Unmount
+	testRpcLeaseClient[0].alreadyUnmounted = true
 
 	testRpcLeaseLogTestCase("2 Shared then 2 Promotions leading to Release", true)
 
@@ -334,10 +341,8 @@ func TestRPCLease(t *testing.T) {
 
 	testRpcLeaseClient[3].sendLeaseRequest(LeaseRequestTypeExclusive)
 
-	// TODO testRpcLeaseClient[0].validateChOutValueIsRPCInterruptType(RPCInterruptTypeRelease)
-	// TODO testRpcLeaseClient[1].validateChOutValueIsRPCInterruptType(RPCInterruptTypeRelease)
-	//
-	//      Above must be re-enabled once Lease Limits are enforced
+	testRpcLeaseClient[0].validateChOutValueIsRPCInterruptType(RPCInterruptTypeRelease)
+	testRpcLeaseClient[1].validateChOutValueIsRPCInterruptType(RPCInterruptTypeRelease)
 
 	testRpcLeaseClient[0].sendLeaseRequest(LeaseRequestTypeRelease)
 	testRpcLeaseClient[1].sendLeaseRequest(LeaseRequestTypeRelease)
@@ -441,9 +446,7 @@ func (testRpcLeaseClient *testRpcLeaseClientStruct) instanceGoroutine() {
 				}
 			} else {
 				if nil != err {
-					if !strings.HasPrefix(err.Error(), ETODO) {
-						testRpcLeaseClient.Fatalf("retryrpcClient.Send(\"Unmount\",,) failed: %v", err)
-					}
+					testRpcLeaseClient.Fatalf("retryrpcClient.Send(\"Unmount\",,) failed: %v", err)
 				}
 			}
 

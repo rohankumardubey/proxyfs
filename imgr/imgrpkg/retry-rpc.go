@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/NVIDIA/sortedmap"
@@ -40,6 +41,7 @@ func startRetryRPCServer() (err error) {
 		DeadlineIO:      globals.config.RetryRPCDeadlineIO,
 		KeepAlivePeriod: globals.config.RetryRPCKeepAlivePeriod,
 		TLSCertificate:  tlsCertificate,
+		Logger:          logLoggerNew("RETRYRPC", globals.config.RetryRPCLogEnabled),
 	}
 
 	globals.retryrpcServer = retryrpc.NewServer(retryrpcServerConfig)
@@ -157,18 +159,18 @@ retryGenerateMountID:
 	}
 
 	mount = &mountStruct{
-		volume:                 volume,
-		mountID:                mountIDAsString,
-		retryRPCClientID:       retryRPCClientID,
-		acceptingLeaseRequests: true,
-		leaseRequestMap:        make(map[uint64]*leaseRequestStruct),
-		leasesExpired:          false,
-		authTokenExpired:       false,
-		authToken:              mountRequest.AuthToken,
-		lastAuthTime:           startTime,
-		mountListMembership:    onHealthyMountList,
-		inodeOpenMap:           make(map[uint64]uint64),
+		volume:              volume,
+		mountID:             mountIDAsString,
+		retryRPCClientID:    retryRPCClientID,
+		unmounting:          false,
+		leaseRequestMap:     make(map[uint64]*leaseRequestStruct),
+		authToken:           mountRequest.AuthToken,
+		lastAuthTime:        startTime,
+		mountListMembership: onHealthyMountList,
+		inodeOpenMap:        make(map[uint64]uint64),
 	}
+
+	mount.volume.mountMapWG.Add(1)
 
 	volume.mountMap[mountIDAsString] = mount
 	mount.mountListElement = volume.healthyMountList.PushBack(mount)
@@ -191,7 +193,7 @@ retryGenerateMountID:
 
 		for _, inodeTableEntryOnDisk = range volume.superBlock.InodeTableLayout {
 			inodeTableEntryInMemory = &inodeTableLayoutElementStruct{
-				objectSize:      inodeTableEntryOnDisk.ObjectSize,
+				bytesWritten:    inodeTableEntryOnDisk.BytesWritten,
 				bytesReferenced: inodeTableEntryOnDisk.BytesReferenced,
 			}
 
@@ -242,7 +244,7 @@ func renewMount(renewMountRequest *RenewMountRequestStruct, renewMountResponse *
 	globals.Lock()
 
 	mount, ok = globals.mountMap[renewMountRequest.MountID]
-	if !ok {
+	if !ok || mount.unmounting {
 		globals.Unlock()
 		err = fmt.Errorf("%s %s", EUnknownMountID, renewMountRequest.MountID)
 		return
@@ -251,44 +253,31 @@ func renewMount(renewMountRequest *RenewMountRequestStruct, renewMountResponse *
 	mount.authToken = renewMountRequest.AuthToken
 
 	if checkAuthToken(mount.volume.storageURL, mount.authToken) {
-		mount.authTokenExpired = false
-
 		switch mount.mountListMembership {
 		case onHealthyMountList:
 			mount.volume.healthyMountList.MoveToBack(mount.mountListElement)
-		case onLeasesExpiredMountList:
-			mount.volume.leasesExpiredMountList.MoveToBack(mount.mountListElement)
 		case onAuthTokenExpiredMountList:
 			_ = mount.volume.authTokenExpiredMountList.Remove(mount.mountListElement)
-			if mount.leasesExpired {
-				mount.mountListElement = mount.volume.leasesExpiredMountList.PushBack(mount)
-				mount.mountListMembership = onLeasesExpiredMountList
-			} else {
-				mount.mountListElement = mount.volume.healthyMountList.PushBack(mount)
-				mount.mountListMembership = onHealthyMountList
-			}
+			mount.mountListElement = mount.volume.healthyMountList.PushBack(mount)
+			mount.mountListMembership = onHealthyMountList
 		default:
-			logFatalf("mount.mountListMembership (%v) not one of on{Healthy|LeasesExpired|AuthTokenExpired}MountList")
+			logFatalf("mount.mountListMembership (%v) not one of on{Healthy|AuthTokenExpired}MountList")
 		}
+
+		err = nil
 	} else {
-		err = fmt.Errorf("%s %s", EAuthTokenRejected, renewMountRequest.AuthToken)
-
-		mount.authTokenExpired = true
-
 		switch mount.mountListMembership {
 		case onHealthyMountList:
 			_ = mount.volume.healthyMountList.Remove(mount.mountListElement)
 			mount.mountListElement = mount.volume.authTokenExpiredMountList.PushBack(mount)
 			mount.mountListMembership = onAuthTokenExpiredMountList
-		case onLeasesExpiredMountList:
-			_ = mount.volume.leasesExpiredMountList.Remove(mount.mountListElement)
-			mount.mountListElement = mount.volume.authTokenExpiredMountList.PushBack(mount)
-			mount.mountListMembership = onAuthTokenExpiredMountList
 		case onAuthTokenExpiredMountList:
 			mount.volume.authTokenExpiredMountList.MoveToBack(mount.mountListElement)
 		default:
-			logFatalf("mount.mountListMembership (%v) not one of on{Healthy|LeasesExpired|AuthTokenExpired}MountList")
+			logFatalf("mount.mountListMembership (%v) not one of on{Healthy|AuthTokenExpired}MountList")
 		}
+
+		err = fmt.Errorf("%s %s", EAuthTokenRejected, renewMountRequest.AuthToken)
 	}
 
 	globals.Unlock()
@@ -298,7 +287,10 @@ func renewMount(renewMountRequest *RenewMountRequestStruct, renewMountResponse *
 
 func unmount(unmountRequest *UnmountRequestStruct, unmountResponse *UnmountResponseStruct) (err error) {
 	var (
-		startTime time.Time = time.Now()
+		mount             *mountStruct
+		ok                bool
+		startTime         time.Time = time.Now()
+		unmountFinishedWG sync.WaitGroup
 	)
 
 	logTracef("==> [RPC] Unmount(unmountRequest: %+v,)", unmountRequest)
@@ -314,7 +306,27 @@ func unmount(unmountRequest *UnmountRequestStruct, unmountResponse *UnmountRespo
 		globals.stats.UnmountUsecs.Add(uint64(time.Since(startTime) / time.Microsecond))
 	}()
 
-	return fmt.Errorf(ETODO + " unmount")
+	globals.Lock()
+
+	mount, ok = globals.mountMap[unmountRequest.MountID]
+	if !ok || mount.unmounting {
+		globals.Unlock()
+		err = fmt.Errorf("%s %s", EUnknownMountID, unmountRequest.MountID)
+		return
+	}
+
+	mount.unmounting = true
+
+	unmountFinishedWG.Add(1)
+
+	go mount.performUnmount(&unmountFinishedWG)
+
+	globals.Unlock()
+
+	unmountFinishedWG.Wait()
+
+	err = nil
+	return
 }
 
 func volumeStatus(volumeStatusRequest *VolumeStatusRequestStruct, volumeStatusResponse *VolumeStatusResponseStruct) (err error) {
@@ -323,7 +335,7 @@ func volumeStatus(volumeStatusRequest *VolumeStatusRequestStruct, volumeStatusRe
 		mount           *mountStruct
 		numInodes       uint64
 		objectCount     uint64
-		objectSize      uint64
+		bytesWritten    uint64
 		ok              bool
 		startTime       time.Time = time.Now()
 	)
@@ -344,7 +356,7 @@ func volumeStatus(volumeStatusRequest *VolumeStatusRequestStruct, volumeStatusRe
 	globals.Lock()
 
 	mount, ok = globals.mountMap[volumeStatusRequest.MountID]
-	if !ok {
+	if !ok || mount.unmounting {
 		globals.Unlock()
 		err = fmt.Errorf("%s %s", EUnknownMountID, volumeStatusRequest.MountID)
 		return
@@ -356,13 +368,13 @@ func volumeStatus(volumeStatusRequest *VolumeStatusRequestStruct, volumeStatusRe
 		return
 	}
 
-	numInodes, objectCount, objectSize, bytesReferenced = mount.volume.statusWhileLocked()
+	numInodes, objectCount, bytesWritten, bytesReferenced = mount.volume.statusWhileLocked()
 
 	globals.Unlock()
 
 	volumeStatusResponse.NumInodes = numInodes
 	volumeStatusResponse.ObjectCount = objectCount
-	volumeStatusResponse.ObjectSize = objectSize
+	volumeStatusResponse.BytesWritten = bytesWritten
 	volumeStatusResponse.BytesReferenced = bytesReferenced
 
 	return
@@ -391,7 +403,7 @@ func fetchNonceRange(fetchNonceRangeRequest *FetchNonceRangeRequestStruct, fetch
 	globals.Lock()
 
 	mount, ok = globals.mountMap[fetchNonceRangeRequest.MountID]
-	if !ok {
+	if !ok || mount.unmounting {
 		globals.Unlock()
 		err = fmt.Errorf("%s %s", EUnknownMountID, fetchNonceRangeRequest.MountID)
 		return
@@ -437,7 +449,7 @@ func getInodeTableEntry(getInodeTableEntryRequest *GetInodeTableEntryRequestStru
 	globals.Lock()
 
 	mount, ok = globals.mountMap[getInodeTableEntryRequest.MountID]
-	if !ok {
+	if !ok || mount.unmounting {
 		globals.Unlock()
 		err = fmt.Errorf("%s %s", EUnknownMountID, getInodeTableEntryRequest.MountID)
 		return
@@ -510,7 +522,7 @@ func putInodeTableEntries(putInodeTableEntriesRequest *PutInodeTableEntriesReque
 	globals.Lock()
 
 	mount, ok = globals.mountMap[putInodeTableEntriesRequest.MountID]
-	if !ok {
+	if !ok || mount.unmounting {
 		globals.Unlock()
 		err = fmt.Errorf("%s %s", EUnknownMountID, putInodeTableEntriesRequest.MountID)
 		return
@@ -555,7 +567,7 @@ func putInodeTableEntries(putInodeTableEntriesRequest *PutInodeTableEntriesReque
 	}
 
 	volume.superBlock.InodeObjectCount = uint64(int64(volume.superBlock.InodeObjectCount) + putInodeTableEntriesRequest.SuperBlockInodeObjectCountAdjustment)
-	volume.superBlock.InodeObjectSize = uint64(int64(volume.superBlock.InodeObjectSize) + putInodeTableEntriesRequest.SuperBlockInodeObjectSizeAdjustment)
+	volume.superBlock.InodeBytesWritten = uint64(int64(volume.superBlock.InodeBytesWritten) + putInodeTableEntriesRequest.SuperBlockInodeBytesWrittenAdjustment)
 	volume.superBlock.InodeBytesReferenced = uint64(int64(volume.superBlock.InodeBytesReferenced) + putInodeTableEntriesRequest.SuperBlockInodeBytesReferencedAdjustment)
 
 	for _, dereferencedObjectNumber = range putInodeTableEntriesRequest.DereferencedObjectNumberArray {
@@ -595,7 +607,7 @@ func deleteInodeTableEntry(deleteInodeTableEntryRequest *DeleteInodeTableEntryRe
 	globals.Lock()
 
 	mount, ok = globals.mountMap[deleteInodeTableEntryRequest.MountID]
-	if !ok {
+	if !ok || mount.unmounting {
 		globals.Unlock()
 		err = fmt.Errorf("%s %s", EUnknownMountID, deleteInodeTableEntryRequest.MountID)
 		return
@@ -658,7 +670,7 @@ func adjustInodeTableEntryOpenCount(adjustInodeTableEntryOpenCountRequest *Adjus
 	globals.Lock()
 
 	mount, ok = globals.mountMap[adjustInodeTableEntryOpenCountRequest.MountID]
-	if !ok {
+	if !ok || mount.unmounting {
 		globals.Unlock()
 		err = fmt.Errorf("%s %s", EUnknownMountID, adjustInodeTableEntryOpenCountRequest.MountID)
 		return
@@ -708,11 +720,17 @@ func adjustInodeTableEntryOpenCount(adjustInodeTableEntryOpenCountRequest *Adjus
 		if adjustInodeTableEntryOpenCountRequest.Adjustment < 0 {
 			logFatalf("adjustInodeTableEntryOpenCountRequest.Adjustment can't be < 0 if inodeOpenMapElement is missing")
 		}
+		if globals.inodeOpenCount >= globals.config.OpenFileLimit {
+			globals.Unlock()
+			err = fmt.Errorf("%s", ETooManyOpens)
+			return
+		}
 		inodeOpenMapElement = &inodeOpenMapElementStruct{
 			numMounts:         0,
 			markedForDeletion: false,
 		}
 		mount.volume.inodeOpenMap[adjustInodeTableEntryOpenCountRequest.InodeNumber] = inodeOpenMapElement
+		globals.inodeOpenCount++
 	}
 
 	if adjustInodeTableEntryOpenCountRequest.Adjustment > 0 {
@@ -729,6 +747,7 @@ func adjustInodeTableEntryOpenCount(adjustInodeTableEntryOpenCountRequest *Adjus
 			inodeOpenMapElement.numMounts--
 			if inodeOpenMapElement.numMounts == 0 {
 				delete(mount.volume.inodeOpenMap, adjustInodeTableEntryOpenCountRequest.InodeNumber)
+				globals.inodeOpenCount--
 				if inodeOpenMapElement.markedForDeletion {
 					mount.volume.removeInodeWhileLocked(adjustInodeTableEntryOpenCountRequest.InodeNumber)
 				}
@@ -771,19 +790,19 @@ func flush(flushRequest *FlushRequestStruct, flushResponse *FlushResponseStruct)
 	globals.Lock()
 
 	mount, ok = globals.mountMap[flushRequest.MountID]
-	if !ok {
+	if !ok || mount.unmounting {
 		globals.Unlock()
 		err = fmt.Errorf("%s %s", EUnknownMountID, flushRequest.MountID)
 		return
 	}
-
-	volume = mount.volume
 
 	if mount.authTokenHasExpired() {
 		globals.Unlock()
 		err = fmt.Errorf("%s %s", EAuthTokenRejected, mount.authToken)
 		return
 	}
+
+	volume = mount.volume
 
 	if nil == volume.checkPointControlChan {
 		globals.Unlock()
@@ -853,13 +872,11 @@ func lease(leaseRequest *LeaseRequestStruct, leaseResponse *LeaseResponseStruct)
 	globals.Lock()
 
 	mount, ok = globals.mountMap[leaseRequest.MountID]
-	if !ok {
+	if !ok || mount.unmounting {
 		globals.Unlock()
 		err = fmt.Errorf("%s %s", EUnknownMountID, leaseRequest.MountID)
 		return
 	}
-
-	volume = mount.volume
 
 	if mount.authTokenHasExpired() {
 		globals.Unlock()
@@ -867,13 +884,9 @@ func lease(leaseRequest *LeaseRequestStruct, leaseResponse *LeaseResponseStruct)
 		return
 	}
 
+	volume = mount.volume
+
 	if (leaseRequest.LeaseRequestType == LeaseRequestTypeShared) || (leaseRequest.LeaseRequestType == LeaseRequestTypeExclusive) {
-		if !mount.acceptingLeaseRequests {
-			globals.Unlock()
-			leaseResponse.LeaseResponseType = LeaseResponseTypeDenied
-			err = fmt.Errorf("%s LeaseRequestType %v not currently being accepted", ELeaseRequestDenied, leaseRequest.LeaseRequestType)
-			return
-		}
 		inodeLease, ok = volume.inodeLeaseMap[leaseRequest.InodeNumber]
 		if !ok {
 			inodeLease = &inodeLeaseStruct{
@@ -882,6 +895,7 @@ func lease(leaseRequest *LeaseRequestStruct, leaseResponse *LeaseResponseStruct)
 				leaseState:           inodeLeaseStateNone,
 				requestChan:          make(chan *leaseRequestOperationStruct),
 				stopChan:             make(chan struct{}),
+				stopping:             false,
 				sharedHoldersList:    list.New(),
 				promotingHolder:      nil,
 				exclusiveHolder:      nil,
@@ -899,6 +913,12 @@ func lease(leaseRequest *LeaseRequestStruct, leaseResponse *LeaseResponseStruct)
 
 			volume.leaseHandlerWG.Add(1)
 			go inodeLease.handler()
+
+			if (globals.inodeLeaseExpirerWG == nil) && (globals.inodeLeaseLRU.Len() > int(globals.config.LeaseEvictHighLimit)) {
+				globals.inodeLeaseExpirerWG = &sync.WaitGroup{}
+				globals.inodeLeaseExpirerWG.Add(1)
+				go inodeLeaseExpirer()
+			}
 		}
 	} else { // in.LeaseRequestType is one of LeaseRequestType{Promote|Demote|Release}
 		inodeLease, ok = volume.inodeLeaseMap[leaseRequest.InodeNumber]
@@ -936,7 +956,7 @@ func (mount *mountStruct) authTokenHasExpired() (authTokenExpired bool) {
 		startTime             time.Time = time.Now()
 	)
 
-	if mount.authTokenExpired {
+	if mount.mountListMembership == onAuthTokenExpiredMountList {
 		return true
 	}
 

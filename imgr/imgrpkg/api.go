@@ -43,6 +43,8 @@
 //
 //  FetchNonceRangeToReturn:              100
 //
+//  OpenFileLimit:                        100000
+//
 //  MinLeaseDuration:                     250ms
 //  LeaseInterruptInterval:               250ms
 //  LeaseInterruptLimit:                  20
@@ -67,6 +69,7 @@
 //  LogFilePath:                                 # imgr.log
 //  LogToConsole:                         true   # false
 //  TraceEnabled:                         false
+//  RetryRPCLogEnabled:                   false
 //
 // Most of the config keys are required and must have values. One exception
 // is LogFilePath that will default to "" and, hence, cause logging to not
@@ -195,6 +198,7 @@ const (
 	EBadOpenCountAdjustment = "EBadOpenCountAdjustment:"
 	ELeaseRequestDenied     = "ELeaseRequestDenied:"
 	EMissingLease           = "EMissingLease:"
+	ETooManyOpens           = "ETooManyOpens"
 	EVolumeBeingDeleted     = "EVolumeBeingDeleted:"
 	EUnknownInodeNumber     = "EUnknownInodeNumber:"
 	EUnknownMountID         = "EUnknownMountID:"
@@ -278,7 +282,7 @@ type VolumeStatusRequestStruct struct {
 type VolumeStatusResponseStruct struct {
 	NumInodes       uint64
 	ObjectCount     uint64
-	ObjectSize      uint64
+	BytesWritten    uint64
 	BytesReferenced uint64
 }
 
@@ -351,7 +355,7 @@ type PutInodeTableEntryStruct struct {
 // (which must have an active Exclusive Lease for every PutInodeTableEntryStruct.InodeNumber
 // granted to the MountID).
 //
-// The SuperBlockInode{ObjectCount|ObjectSize|BytesReferenced}Adjustment fields
+// The SuperBlockInode{ObjectCount|BytesWritten|BytesReferenced}Adjustment fields
 // are used to update the corresponding fields in the volume's SuperBlock.
 //
 // Note that dereferenced objects listed in the DereferencedObjectNumberArray will
@@ -361,7 +365,7 @@ type PutInodeTableEntriesRequestStruct struct {
 	MountID                                  string
 	UpdatedInodeTableEntryArray              []PutInodeTableEntryStruct
 	SuperBlockInodeObjectCountAdjustment     int64
-	SuperBlockInodeObjectSizeAdjustment      int64
+	SuperBlockInodeBytesWrittenAdjustment    int64
 	SuperBlockInodeBytesReferencedAdjustment int64
 	DereferencedObjectNumberArray            []uint64
 }
@@ -395,7 +399,7 @@ type DeleteInodeTableEntryResponseStruct struct{}
 // unless/until the OpenCount for the Inode drops to zero, the Inode will
 // still exist.
 //
-// Possible errors: ETODO
+// Possible errors: EAuthTokenRejected EMissingLease EUnknownMountID
 //
 func (dummy *RetryRPCServerStruct) DeleteInodeTableEntry(deleteInodeTableEntryRequest *DeleteInodeTableEntryRequestStruct, deleteInodeTableEntryResponse *DeleteInodeTableEntryResponseStruct) (err error) {
 	return deleteInodeTableEntry(deleteInodeTableEntryRequest, deleteInodeTableEntryResponse)

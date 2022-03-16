@@ -49,7 +49,7 @@ func performMountFUSE() (err error) {
 		fuseDefaultPermissions,
 		globals.config.FUSEAllowOther,
 		&globals,
-		newLogger(),
+		logLoggerNew("FISSION", globals.config.FUSELogEnabled),
 		globals.fissionErrChan,
 	)
 
@@ -63,12 +63,18 @@ func performMountFUSE() (err error) {
 
 func performUnmountFUSE() (err error) {
 	err = globals.fissionVolume.DoUnmount()
+	if nil != err {
+		return
+	}
 
 	globals.fissionVolume = nil
+
+	// TODO: Here would be a great place to at least flush any dirty inodes
 
 	globals.fuseEntryValidDurationSec, globals.fuseEntryValidDurationNSec = 0, 0
 	globals.fuseAttrValidDurationSec, globals.fuseAttrValidDurationNSec = 0, 0
 
+	err = nil
 	return
 }
 
@@ -335,37 +341,42 @@ Retry:
 		}
 	}
 
-	inode.dirty = true
-
-	inode.inodeHeadV1.StatusChangeTime = startTime
-
 	if (setAttrIn.Valid & fission.SetAttrInValidMode) != 0 {
+		inode.dirty = true
 		inode.inodeHeadV1.Mode = uint16(setAttrIn.Mode & uint32(syscall.S_IRWXU|syscall.S_IRWXG|syscall.S_IRWXO))
 	}
 
 	if (setAttrIn.Valid & fission.SetAttrInValidUID) != 0 {
+		inode.dirty = true
 		inode.inodeHeadV1.UserID = uint64(setAttrIn.UID)
 	}
 
 	if (setAttrIn.Valid & fission.SetAttrInValidGID) != 0 {
+		inode.dirty = true
 		inode.inodeHeadV1.GroupID = uint64(setAttrIn.GID)
 	}
 
 	if (setAttrIn.Valid & fission.SetAttrInValidSize) != 0 {
-		if setAttrIn.Size < inode.inodeHeadV1.Size {
-			if inode.payload == nil {
-				err = inode.oldPayload()
-				if nil != err {
-					logFatalf("inode.oldPayload() failed: %v", err)
-				}
-			}
+		if setAttrIn.Size != inode.inodeHeadV1.Size {
+			inode.dirty = true
+			inode.inodeHeadV1.ModificationTime = startTime
 
-			inode.unmapExtent(setAttrIn.Size, 0)
+			if setAttrIn.Size < inode.inodeHeadV1.Size {
+				if inode.payload == nil {
+					err = inode.oldPayload()
+					if nil != err {
+						logFatalf("inode.oldPayload() failed: %v", err)
+					}
+				}
+
+				inode.unmapExtent(setAttrIn.Size, 0)
+			}
+			inode.inodeHeadV1.Size = setAttrIn.Size
 		}
-		inode.inodeHeadV1.Size = setAttrIn.Size
 	}
 
 	if (setAttrIn.Valid & fission.SetAttrInValidMTime) != 0 {
+		inode.dirty = true
 		if (setAttrIn.Valid & fission.SetAttrInValidMTimeNow) != 0 {
 			inode.inodeHeadV1.ModificationTime = startTime
 		} else {
@@ -373,9 +384,12 @@ Retry:
 		}
 	}
 
-	inodeNumber = inode.inodeNumber
+	if inode.dirty {
+		inode.inodeHeadV1.StatusChangeTime = startTime
+		flushInodesInSlice([]*inodeStruct{inode})
+	}
 
-	flushInodesInSlice([]*inodeStruct{inode})
+	inodeNumber = inode.inodeNumber
 
 	inodeLockRequest.unlockAll()
 
@@ -538,8 +552,6 @@ Retry:
 	symLinkInode = &inodeStruct{
 		inodeNumber:     symLinkInodeNumber,
 		dirty:           true,
-		openCount:       0,
-		markedForDelete: false,
 		leaseState:      inodeLeaseStateNone,
 		listElement:     nil,
 		lockHolder:      nil,
@@ -566,7 +578,7 @@ Retry:
 		layoutMap:                                make(map[uint64]layoutMapEntryStruct),
 		payload:                                  nil,
 		superBlockInodeObjectCountAdjustment:     0,
-		superBlockInodeObjectSizeAdjustment:      0,
+		superBlockInodeBytesWrittenAdjustment:    0,
 		superBlockInodeBytesReferencedAdjustment: 0,
 		dereferencedObjectNumberArray:            make([]uint64, 0),
 		putObjectNumber:                          0,
@@ -744,8 +756,6 @@ Retry:
 	childDirInode = &inodeStruct{
 		inodeNumber:     childDirInodeNumber,
 		dirty:           true,
-		openCount:       0,
-		markedForDelete: false,
 		leaseState:      inodeLeaseStateNone,
 		listElement:     nil,
 		lockHolder:      nil,
@@ -772,7 +782,7 @@ Retry:
 		layoutMap:                                make(map[uint64]layoutMapEntryStruct),
 		payload:                                  nil,
 		superBlockInodeObjectCountAdjustment:     0,
-		superBlockInodeObjectSizeAdjustment:      0,
+		superBlockInodeBytesWrittenAdjustment:    0,
 		superBlockInodeBytesReferencedAdjustment: 0,
 		dereferencedObjectNumberArray:            make([]uint64, 0),
 		putObjectNumber:                          0,
@@ -1033,8 +1043,6 @@ Retry:
 	flushInodesInSlice([]*inodeStruct{dirInode, targetInode})
 
 	if len(targetInode.linkSet) == 0 {
-		inodeLockRequest.markForDelete(targetInode.inodeNumber)
-
 		deleteInodeTableEntryRequest = &imgrpkg.DeleteInodeTableEntryRequestStruct{
 			MountID:     globals.mountID,
 			InodeNumber: targetInode.inodeNumber,
@@ -1201,8 +1209,6 @@ Retry:
 	}
 
 	flushInodesInSlice([]*inodeStruct{parentDirInode})
-
-	inodeLockRequest.markForDelete(childDirInode.inodeNumber)
 
 	deleteInodeTableEntryRequest = &imgrpkg.DeleteInodeTableEntryRequestStruct{
 		MountID:     globals.mountID,
@@ -2015,6 +2021,18 @@ Retry:
 		return
 	default:
 		logFatalf("inode.inodeHeadV1.InodeType(%v) unexpected - must be either ilayout.InodeTypeDir(%v) or ilayout.InodeTypeFile(%v)", inode.inodeHeadV1.InodeType, ilayout.InodeTypeDir, ilayout.InodeTypeFile)
+	}
+
+	if writeIn.Size == 0 {
+		inodeLockRequest.unlockAll()
+
+		writeOut = &fission.WriteOut{
+			Size:    0,
+			Padding: 0,
+		}
+
+		errno = 0
+		return
 	}
 
 	if inode.payload == nil {
@@ -2989,7 +3007,8 @@ func (dummy *globalsStruct) DoFSyncDir(inHeader *fission.InHeader, fSyncDirIn *f
 		globals.stats.DoFSyncDirUsecs.Add(uint64(time.Since(startTime) / time.Microsecond))
 	}()
 
-	// TODO
+	// TODO: Anything to do here?
+
 	errno = syscall.ENOSYS
 	return
 }
@@ -3199,8 +3218,6 @@ Retry:
 		fileInode = &inodeStruct{
 			inodeNumber:     fileInodeNumber,
 			dirty:           true,
-			openCount:       0,
-			markedForDelete: false,
 			leaseState:      inodeLeaseStateNone,
 			listElement:     nil,
 			lockHolder:      nil,
@@ -3227,7 +3244,7 @@ Retry:
 			layoutMap:                                make(map[uint64]layoutMapEntryStruct),
 			payload:                                  nil,
 			superBlockInodeObjectCountAdjustment:     0,
-			superBlockInodeObjectSizeAdjustment:      0,
+			superBlockInodeBytesWrittenAdjustment:    0,
 			superBlockInodeBytesReferencedAdjustment: 0,
 			dereferencedObjectNumberArray:            make([]uint64, 0),
 			putObjectNumber:                          0,
@@ -3359,7 +3376,8 @@ func (dummy *globalsStruct) DoDestroy(inHeader *fission.InHeader) (errno syscall
 		globals.stats.DoDestroyUsecs.Add(uint64(time.Since(startTime) / time.Microsecond))
 	}()
 
-	// TODO
+	// TODO: Anything to do here?
+
 	errno = syscall.ENOSYS
 	return
 }
@@ -4167,8 +4185,6 @@ Retry:
 		}
 
 		if len(replacedInode.linkSet) == 0 {
-			inodeLockRequest.markForDelete(replacedInode.inodeNumber)
-
 			deleteInodeTableEntryRequest = &imgrpkg.DeleteInodeTableEntryRequestStruct{
 				MountID:     globals.mountID,
 				InodeNumber: replacedInode.inodeNumber,
